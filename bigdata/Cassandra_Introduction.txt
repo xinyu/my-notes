@@ -1,0 +1,195 @@
+
+Cassandra 操作指引
+
+一、介绍
+二、环境
+三、CQL基础操作
+四、C++ / Python Cassandra 客户端开发
+五、安装
+
+
+一、介绍
+Cassandra是一个支持自动分片扩容，自动复制，高可用的NoSQL数据库。
+The Apache Cassandra database is the right choice when you need scalability and high availability without compromising performance. Linear scalability and proven fault-tolerance on commodity hardware or cloud infrastructure make it the perfect platform for mission-critical data. Cassandra's support for replicating across multiple datacenters is best-in-class, providing lower latency for your users and the peace of mind of knowing that you can survive regional outages. 
+
+Cassandra 可以看作如下的嵌套的有序Key-Value数据结构，对于数据存储来说，存储对象很灵活，图片／语音／文档等都可以直接存储，可以取代部分S3的存储功能。
+SortedMap<RowKey, SortedMap<ColumnKey, ColumnValue>>
+
+使用Cassandra需要注意：
+1. Cassandra 是最终一致性的设计。对于有严格事务性要求的业务，还是需要存储在MySQL数据库。
+2. Cassandra 不支持建立多级索引，
+一般根据典型的查询模式创建好表的分片Key和索引Key后，后续查询都需要按照已有的Key来查询。如果有多种不同的典型查询模式，一方面可以建立不同的表来支持，另外也可以结合Map-Reduce等计算引擎将数据按照固定的Key查询出来再进行各种过滤分析。
+3. Casandra和SQL数据库不同，不支持Join等操作，允许表的数据冗余。
+
+
+二、环境
+cassandra-1 192.168.1.112
+cassandra-2 192.168.1.115
+cassandra-3 192.168.1.116
+
+$ /opt/cassandra/bin/nodetool status
+Datacenter: dc1
+===============
+Status=Up/Down
+|/ State=Normal/Leaving/Joining/Moving
+--  Address         Load       Tokens       Owns    Host ID                               Rack
+UN  192.168.1.112  236.99 MB  256          ?       d6636842-230c-47b5-bc72-00a3ba4f8508  rack1
+UN  192.168.1.115  237.08 MB  256          ?       d7a74f53-5cf2-4439-816f-bb0725560bf4  rack1
+UN  192.168.1.116  236.93 MB  256          ?       8571e31f-ae45-42e9-9fbd-775c8a0c67ed  rack1
+
+三、CQL基础操作
+CQLSH是Cassandra数据库操作的命令行客户端，目前可以用这个命令行客户端操作或者Python脚本自动查询，后续集成计算引擎后会考虑可视化的前端页面。
+http://cassandra.apache.org/doc/latest/cql/index.html
+
+[test@cassandra-1 ~]$ /opt/cassandra/bin/cqlsh 192.168.1.112
+Connected to Test Data at 192.168.1.112:9042.
+[cqlsh 5.0.1 | Cassandra 3.0.16 | CQL spec 3.4.0 | Native protocol v4]
+Use HELP for help.
+cqlsh> 
+
+KEYSPACE相当于MySQL的Database，下面是创建nginx_log的KEYSPACE。
+CREATE KEYSPACE nginx_log WITH replication = {'class': 'SimpleStrategy', 'replication_factor' : 1};
+
+删除KEYSPACE。
+DROP KEYSPACE XXXX;
+
+查看KEYSPACE信息。
+DESCRIBE KEYSPACES;
+DESCRIBE KEYSPACE <keyspace name>;
+
+进入nginx_log数据库。
+USE nginx_log;
+
+查看表信息。
+DESCRIBE TABLES;
+DESCRIBE TABLE <table name>;
+
+创建表。
+CREATE TABLE nginx_test(
+log_id timeuuid,
+log_type text,
+content text,
+timestamp_t timestamp,
+PRIMARY KEY (log_type, log_id)
+) WITH CLUSTERING ORDER BY (log_id DESC) ;
+
+删除和清空表数据。
+DROP TABLE [ IF EXISTS ] table_name
+TRUNCATE [ TABLE ] table_name
+
+创建表需要注意：
+nginx_test的PRIMARY KEY (log_type, log_id)，
+log_type是partition key，partition key最好是选择让数据可以根据Hash均匀分布的Key，这样可以将读写压力分布到多个节点，timestamp作为partition key不是一个好的选择，因为同时间写入负荷会集中到部分节点。
+Cassandra要求表数据按PRIMARY KEY唯一，一些日志类型的表如果不好选择唯一的Key作为PRIMARY KEY时，可以用timeuuid字段作为唯一标示，相比于uuid，timeuuid包含时间因子，这样后续查询时方便按时间范围查询。
+
+一些查询示例。
+按条件查询时一般只能指定PRIMARY KEY查询，非索引Key一般不能作为where条件，详细参考下面页面。
+http://cassandra.apache.org/doc/latest/cql/dml.html
+
+select * from nginx_test limit 1;
+
+select log_id, log_type, timestamp_t, content from nginx_test where log_type = 'LOGIN_FAIL' and log_id >= maxTimeuuid('2018-11-27 09:30:00+0800') and log_id < minTimeuuid('2018-11-27 09:31:00+0800');
+
+非索引Key过滤数据时，可以增加ALLOW FILTERING参数。
+
+四、C++ / Python Cassandra 客户端开发
+
+C++ / Python 客户端开发参考下面项目:
+https://github.com/datastax/cpp-driver
+https://github.com/datastax/python-driver
+
+
+五、安装
+
+------------------------------------------------------------
+------------------------------------------------------------
+Install Java 8
+
+cd ~
+curl -O http://192.168.1.99/tools/jdk-8u151-linux-x64.rpm
+yum -y localinstall jdk-8u151-linux-x64.rpm
+java -version
+
+vi .bash_profile
+export JAVA_HOME=/usr/java/default
+
+192.168.1.99 数据中心内网资源库地址。
+
+------------------------------------------------------------
+------------------------------------------------------------
+Cassandra
+
+cd /opt
+curl -O http://192.168.1.99/tools/apache-cassandra-3.0.16-bin.tar.gz
+
+tar zxf apache-cassandra-3.0.16-bin.tar.gz
+
+ln -s /opt/apache-cassandra-3.0.16 /opt/cassandra
+
+mkdir -p /data/cassandra/data
+mkdir -p /data/cassandra/commitlog
+mkdir -p /data/cassandra/hints
+mkdir -p /data/cassandra/saved_caches
+
+vi conf/cassandra.yaml
+hints_directory: /data/cassandra/hints
+data_file_directories:
+    - /data/cassandra/data
+commitlog_directory: /data/cassandra/commitlog
+saved_caches_directory: /data/cassandra/saved_caches
+
+Start Cassandra in the foreground
+bin/cassandra -f
+
+bin/nodetool status
+
+bin/cqlsh localhost
+cqlsh> SELECT cluster_name, listen_address FROM system.local;
+
+
+Cassandra 部分性能调优的配置
+thrift_framed_transport_size_in_mb: 100 
+commitlog_segment_size_in_mb: 64
+read_request_timeout_in_ms: 600000
+range_request_timeout_in_ms: 600000
+write_request_timeout_in_ms: 600000
+cas_contention_timeout_in_ms: 1000
+truncate_request_timeout_in_ms: 600000 
+request_timeout_in_ms: 600000
+batch_size_warn_threshold_in_kb: 5000
+batch_size_fail_threshold_in_kb: 10000
+
+
+
+增加新节点步骤
+cd /opt
+curl -O http://192.168.1.99/tools/apache-cassandra-3.0.16-bin.tar.gz
+tar zxf apache-cassandra-3.0.16-bin.tar.gz
+ln -s /opt/apache-cassandra-3.0.16 /opt/cassandra
+mkdir -p /data/cassandra/data
+mkdir -p /data/cassandra/commitlog
+mkdir -p /data/cassandra/hints
+mkdir -p /data/cassandra/saved_caches
+# 从原来的节点获取配置文件，配置保持一致
+cd cassandra/conf/
+cp cassandra-1:/opt/cassandra/conf/cassandra-rackdc.properties ./
+cp cassandra-1:/opt/cassandra/conf/cassandra.yaml ./
+cp cassandra-1:/opt/cassandra/conf/jvm.options ./
+chown root:root cassandra-rackdc.properties
+chown root:root cassandra.yaml
+bin/cassandra
+bin/nodetool status
+# 增加新节点数据重新分布后，原有节点多余数据清除
+bin/nodetool repair -pr
+bin/nodetool cleanup
+
+------------------------------------------------------------
+------------------------------------------------------------
+
+
+参考资料:
+http://cassandra.apache.org/doc/latest/
+https://github.com/datastax/cpp-driver
+https://github.com/datastax/python-driver
+https://www.ebayinc.com/stories/blogs/tech/cassandra-data-modeling-best-practices-part-1/
+

@@ -1,0 +1,122 @@
+ceph 集群更换硬盘
+
+1. 找到media错误计数最多的磁盘slot号
+/opt/MegaRAID/MegaCli/MegaCli64 -PDList -aALL | grep -e '^$' -e Slot -e Count -e state
+Slot Number: 3
+Media Error Count: 9
+Other Error Count: 1
+Predictive Failure Count: 0
+Firmware state: Online, Spun Up
+
+2. 确认盘符
+dmesg -T | grep Medium
+[Sat Jun  8 12:03:45 2018] sd 0:2:6:0: [sdi] tag#32 Sense Key : Medium Error [current] 
+[Sat Jun  8 12:03:56 2018] sd 0:2:6:0: [sdi] tag#0 Sense Key : Medium Error [current] 
+[Sat Jun  8 12:03:56 2018] sd 0:2:6:0: [sdi] tag#0 Sense Key : Medium Error [current] 
+[Thu Jun 27 16:04:25 2018] sd 0:2:2:0: [sde] tag#64 Sense Key : Medium Error [current] 
+[Thu Jun 27 16:04:45 2018] sd 0:2:2:0: [sde] tag#55 Sense Key : Medium Error [current] 
+[Thu Jun 27 16:04:45 2018] sd 0:2:2:0: [sde] tag#46 Sense Key : Medium Error [current] 
+[Thu Jun 27 16:04:45 2018] sd 0:2:2:0: [sde] tag#30 Sense Key : Medium Error [current] 
+
+3. 确认挂载点
+lsblk -f
+sde                                                                           
+`-sde1          xfs         ceph03disk2  eb544d60-bf24-4bbd-bc03-9628bcb78749   /data/disk2
+
+4. 确认OSD号
+cat /data/disk2/whoami 
+31
+
+5. Find the failed OSD.
+ceph osd tree
+
+ceph osd set noscrub
+ceph osd set nodeep-scrub
+
+6. Take OSD out.
+ceph osd crush reweight osd.31 0.0
+
+ceph -s  # 查询ceph状态
+ceph osd df # 下线的osd数据已经迁移完
+等待ceph集群数据重新平衡完成
+
+ceph osd out 31
+
+7. Stop the OSD daemon on the node.
+systemctl stop ceph-osd@31
+
+8. Check Ceph’s status.
+ceph -s
+ceph osd tree
+ceph osd df
+
+9. Remove the OSD from the CRUSH map. 
+ceph osd crush remove osd.31
+
+10. Delete the OSD authorization.
+ceph auth del osd.31
+ceph auth list
+
+11. Remove the OSD from the storage cluster. 
+ceph osd rm osd.31
+
+12. Unmount the filesystem on node.
+umount /data/disk2
+
+13. Replace the failed drive.
+ceph osd set noout
+
+/opt/MegaRAID/MegaCli/MegaCli64 -PDList  -aALL | grep -e '^$' -e Slot -e Count -e state
+# 需要更换的盘停止闪灯，方便确认需要更换的盘
+/opt/MegaRAID/MegaCli/MegaCli64 -PdLocate -stop –physdrv[32:3] -a0
+服务器编号为3的磁盘（第4块磁盘）拔出
+插入新的盘
+
+新的盘加入阵列
+/opt/MegaRAID/MegaCli/MegaCli64 -CfgLdAdd -r0[32:3] -a0
+
+14. Add the OSD back to the storage cluster. 
+
+parted /dev/sde mktable gpt
+parted /dev/sde mkpart ceph03disk2 0% 100% 
+mkdir -p /data/disk2
+mkfs.xfs -f -i size=512 -l size=128m,lazy-count=1 -L ceph03disk2 /dev/sde1
+
+下面LOG分区不需要执行，之前已经创建
+# parted /dev/sda mkpart journal2 21% 40%
+
+mount -t xfs -o noatime,nodiratime,nobarrier /dev/disk/by-label/ceph03disk2 /data/disk2
+
+chown ceph:ceph /dev/sda2
+
+ssh ceph-admin
+cd ceph-cluster
+[ceph@ceph-admin ceph-cluster]$ ceph-deploy osd create \
+ceph03:/data/disk2:/dev/disk/by-partlabel/journal2
+
+登陆ceph03机器执行下面指令
+sudo chown -R ceph:ceph /data/disk2
+
+ssh ceph-admin
+cd ceph-cluster
+[ceph@ceph-admin ceph-cluster]$ ceph-deploy osd activate \
+ceph03:/data/disk2:/dev/disk/by-partlabel/journal2
+
+登陆ceph03机器执行下面指令
+systemctl enable ceph-osd@31
+
+ceph osd tree
+
+osd分配权值和加入所属的主机
+# ceph osd crush create-or-move osd.31 3.6381 root=default host=ceph03
+# ceph osd crush reweight osd.31 3.6381
+
+等待ceph集群数据恢复完成
+
+15. Check Ceph’s status.
+ceph -s
+ceph osd df
+ceph osd unset noout
+ceph osd unset noscrub
+ceph osd unset nodeep-scrub
+

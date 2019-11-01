@@ -1,0 +1,58 @@
+Ceph PG inconsistent 错误修复
+
+1. ceph显示下面的PG数据不一致，PG编号：4.10b，PG存储的osd磁盘编号：15和21
+[root@ceph01 ~]# ceph health detail
+HEALTH_ERR 1 pgs inconsistent; 1 scrub errors
+pg 4.10b is active+clean+inconsistent, acting [15,21]
+1 scrub errors
+
+2. 登录错误PG所在OSD，查询OSD的日志，找到对应的错误对象ID：rbd_data.3991354d44ae6.0000000000002afd
+grep ERR /var/log/ceph/ceph-osd.15.log-20180614 
+2018-06-13 21:40:15.130251 7fa2e33f5700 -1 log_channel(cluster) log [ERR] : 4.10b shard 21: soid 4:d08f0924:::rbd_data.3991354d44ae6.0000000000002afd:head candidate had a read error
+2018-06-13 21:40:32.845848 7fa2e5bfa700 -1 log_channel(cluster) log [ERR] : 4.10b deep-scrub 0 missing, 1 inconsistent objects
+2018-06-13 21:40:32.845856 7fa2e5bfa700 -1 log_channel(cluster) log [ERR] : 4.10b deep-scrub 1 errors
+
+3. 登录对应的OSD主机，找到对应的错误对象路径，分析原因
+Find the object:
+find /var/lib/ceph/osd/ceph-15/current/4.10b_head/ -name '*data.3991354d44ae6.0000000000002afd*' -ls
+2227549826 4112 -rw-r--r--   1 ceph     ceph      4194304 Nov 15  2017 /var/lib/ceph/osd/ceph-15/current/4.10b_head/rbd\\udata.3991354d44ae6.0000000000002afd__head_2490F10B__4
+
+find /var/lib/ceph/osd/ceph-21/current/4.10b_head/ -name '*data.3991354d44ae6.0000000000002afd*' -ls
+24994434 4112 -rw-r--r--   1 ceph     ceph      4194304 Nov 15  2017 /var/lib/ceph/osd/ceph-21/current/4.10b_head/rbd\\udata.3991354d44ae6.0000000000002afd__head_2490F10B__4
+
+OSD-15这个对象可以正常查看，OSD-21这个对象查看时显示IO错误，查看dmesg日志，显示OSD-21这个磁盘有坏道.
+[Sat Jun  9 10:21:58 2018] megaraid_sas 0000:03:00.0: 1875 (581829474s/0x0001/FATAL) - Uncorrectable medium error logged for VD 02/2 at 193946a (on PD 03(e0x20/s3) at 193946a)
+[Wed Jun 13 20:41:55 2018] sd 0:2:2:0: [sde] tag#0 FAILED Result: hostbyte=DID_OK driverbyte=DRIVER_SENSE
+[Wed Jun 13 20:41:55 2018] sd 0:2:2:0: [sde] tag#0 Sense Key : Medium Error [current] 
+
+清楚的可以得到原因，OSD-21磁盘坏道导致这个PG对象数据不一致。
+
+4. 修复步骤
+4.1 设置OSD为noout状态，避免下面停止OSD时的PG数据移动。
+ceph osd set noout
+
+4.2 停止OSD-21
+systemctl status ceph-osd@21
+systemctl stop ceph-osd@21
+
+4.3 OSD-21的日志刷新
+ceph-osd –i 21 –-flush-journal
+
+4.4 因为OSD-21的这个错误对象是磁盘坏道导致，不能copy或者mv备份此对象，直接在OSD-21所在磁盘，rm删除此对象。OSD-15这个对象是正常的，也可以在OSD-15将这个对象备份下。
+rm rbd\\udata.3991354d44ae6.0000000000002afd__head_2490F10B__4
+
+4.5 启动OSD
+systemctl start ceph-osd@21
+
+4.6 修复PG
+ceph pg repair 4.10b
+
+4.6 恢复OSD的noout标志
+ceph osd unset noout
+
+4.7 查看ceph状态，PG已经修复
+ceph health detail
+
+
+参考：
+https://swamireddy.wordpress.com/2016/04/19/ceph-health-err-repair-pg/

@@ -1,0 +1,190 @@
+
+Ceph RGW 对象存储网关安装步骤
+
+1. 基础操作系统配置和升级
+cd /etc/yum.repos.d
+curl -O http://192.168.1.99/repos/CentOS-Base.repo
+
+yum clean all
+yum makecache
+
+yum update -y
+reboot
+
+2. ceph 基础包安装
+curl -O http://192.168.1.99/repos/epel.repo
+curl -O http://192.168.1.99/repos/CentOS-Ceph-Jewel.repo
+yum clean all
+yum makecache
+
+yum install ceph ceph-radosgw -y
+
+3. ceph 用户配置
+useradd -d /home/ceph -m ceph
+echo -e "ceph\nceph\n" | passwd ceph
+echo "ceph ALL = (root) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/ceph
+chmod 0440 /etc/sudoers.d/ceph
+echo -e 'Defaults:ceph !requiretty\nceph ALL = (root) NOPASSWD:ALL' | tee /etc/sudoers.d/ceph
+chmod 440 /etc/sudoers.d/ceph
+
+3. ceph 对象存储网关配置
+
+登录ceph admin节点，和新的对象存储网关节点建立ceph用户的ssh免密码登录。
+
+部署和配置RGW：
+ceph-deploy install --rgw rgw01
+
+ceph-deploy rgw create rgw01
+
+测试：
+curl http://127.0.0.1:7480
+
+修改默认配置，端口修改为80
+vi ceph.conf
+[client.rgw.dev13]
+rgw_frontends = "civetweb port=80"
+host = dev13
+# keyring = /etc/ceph/ceph.client.radosgw.keyring
+rgw dns name = tests3.test.net
+rgw_resolve_cname = True
+rgw socket path = /var/run/ceph/ceph-client.rgw.dev13.asok
+rgw content length compat = true
+
+systemctl restart ceph-radosgw@rgw.rgw01
+
+curl http://127.0.0.1
+
+4. Nginx 转发配置
+nginx:
+vi tests3.test.net.conf
+upstream tests3_group {
+    server 192.168.1.XX weight=1 max_fails=3 fail_timeout=60s;
+    server 192.168.1.XX weight=1 max_fails=3 fail_timeout=60s;
+}
+
+server {
+    listen 80;
+
+    server_name tests3.test.net;
+
+    access_log  /data/nginx/logs/tests3.test.net.log upstream;
+    error_log   /data/nginx/logs/tests3.test.net.error;
+
+    client_max_body_size 4m;
+
+    proxy_buffering off;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $remote_addr;
+
+    location / {
+        proxy_next_upstream error timeout invalid_header http_500 http_502 http_503 http_504 http_404;
+        proxy_pass          http://tests3_group;
+        include             conf/proxy_params;
+        proxy_http_version  1.1;
+        proxy_set_header    Connection "";
+        proxy_set_header  X-Real-IP  $remote_addr;
+        proxy_set_header  X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+}
+
+
+5. ceph 对象存储网关用fastcgi方式接入nginx配置
+
+修改rgw01主机的ceph配置文件，将rgw前端修改为fastcgi方式。
+vi ceph.conf
+rgw frontends = fastcgi socket_port=7488 socket_host=0.0.0.0
+
+nginx 配置：
+upstream tests3_group {
+    server 192.168.1.xx:7488 weight=1 max_fails=3 fail_timeout=60s;
+    server 192.168.1.xx:7488 weight=1 max_fails=3 fail_timeout=60s;
+}
+
+server {
+    listen 80;
+
+    server_name tests3.test.net;
+
+    access_log  /data/nginx/logs/tests3.test.net.log upstream;
+    error_log   /data/nginx/logs/tests3.test.net.error;
+
+    client_max_body_size 4m;
+
+    location / {
+        include               fastcgi_params;
+        fastcgi_next_upstream error timeout invalid_header http_500 http_503 http_404;
+        fastcgi_pass          tests3_group;
+    }
+}
+
+6. 对象存储操作
+
+6.1 创建账号
+radosgw-admin user create --uid=testuser --display-name=testuser
+
+"user": "testuser",
+"access_key": "51J5G6XE2K76091R4WAP",
+"secret_key": "E8hnOdkPsoWr5cwsfYvnJIc5ktC7W5D0lAnUt1EF"
+
+6.2 s3cmd方式操作对象存储
+yum install s3cmd
+
+vi $HOME/.s3cfg
+[default]
+access_key = 51J5G6XE2K76091R4WAP
+secret_key = E8hnOdkPsoWr5cwsfYvnJIc5ktC7W5D0lAnUt1EF
+host_base = tests3.test.net 
+host_bucket = tests3.test.net/%(bucket)
+use_https = False
+
+# 列出存储桶
+s3cmd ls
+# 创建存储桶
+s3cmd mb s3://photos
+# 上传对象，对象key为 2017-09-07/test0001
+s3cmd put photos/test0001 s3://photos/2017-09-07/
+# 列出photos/2017-09-07/下的对象
+s3cmd ls s3://photos/2017-09-07/
+# 查看对象信息
+s3cmd info s3://photos/2017-09-07/test0001
+# 下载对象
+s3cmd get s3://photos/2017-09-07/test0001
+
+# 设置对象权限
+s3cmd setacl --acl-public s3://photos/2017-09-07/test0001
+             --acl-private
+             --acl-grant=PERMISSION:EMAIL or USER_CANONICAL_ID
+
+
+
+7. 注意事项
+初始化安装ceph对象存储网关时，默认的ceph pool的pg不符合要求时可以删除后重新创建。
+sudo ceph osd pool delete .rgw.XXX .rgw.XXX --yes-i-really-really-mean-it
+
+sudo ceph osd pool create .rgw.root 32 32
+sudo ceph osd pool create default.rgw.control 16 16
+sudo ceph osd pool create default.rgw.data.root 32 32
+sudo ceph osd pool create default.rgw.gc 16 16
+sudo ceph osd pool create default.rgw.log 16 16
+sudo ceph osd pool create default.rgw.users.uid 16 16
+sudo ceph osd pool create default.rgw.users.keys 16 16
+sudo ceph osd pool create default.rgw.meta 16 16
+sudo ceph osd pool create default.rgw.buckets.index 32 32
+sudo ceph osd pool create default.rgw.buckets.data 64 64
+sudo ceph osd pool create default.rgw.buckets.non-ec 16 16
+
+
+
+8. 参考：
+http://docs.ceph.com/docs/jewel/radosgw/s3/
+http://docs.aws.amazon.com/zh_cn/AmazonS3/latest/dev/Welcome.html
+http://docs.aws.amazon.com/zh_cn/AmazonS3/latest/dev/Introduction.html
+https://help.aliyun.com/document_detail/31827.html?spm=5176.doc52830.2.1.YKJTR1
+
+http://s3.test.net/photos/2017-09-07/test0001 中，“photos”是存储桶的名称，而“2017-09-07/test0001”是键。
+
+s3cmd 和 s3curl 是两个比较常用的s3命令行工具
+http://s3tools.org
+https://github.com/basho/riak_cs/wiki/Using-s3curl
+
+

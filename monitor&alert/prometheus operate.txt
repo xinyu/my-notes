@@ -1,0 +1,82 @@
+prometheus
+
+介绍
+Prometheus是基于golang的一套开源监控和告警工具集，SoundCloud公司从2012年开始开发，2015年开源。
+Prometheus特点
+1. 多维数据模型（时序数据由 metric 名和一组K/V标签构成）。
+2. 灵活强大的查询语句（PromQL）。
+3. 不依赖存储，支持local和remote(OpenTSDB、InfluxDB等)不同模型。
+4. 采用 HTTP协议，使用Pull模式采集数据。
+5. 监控目标，可以采用服务发现或静态配置的方式。
+6. 支持多种统计数据模型，图形化友好(Grafana)。
+ 
+数据类型
+Counter
+Counter表示收集的数据是按照某个趋势（增加／减少）一直变化的。
+Gauge
+Gauge表示搜集的数据是瞬时的，可以任意变高变低。
+Histogram
+Histogram可以理解为直方图，主要用于表示一段时间范围内对数据进行采样，（通常是请求持续时间或响应大小），并能够对其指定区间以及总数进行统计。
+Summary
+Summary和Histogram十分相似，主要用于表示一段时间范围内对数据进行采样，（通常是请求持续时间或响应大小），它直接存储了 quantile 数据，而不是根据统计区间计算出来的。
+
+Adding metrics to your app is easy,  just import prometheus client and register metrics HTTP handler http.Handle("/metrics", promhttp.Handler())
+
+
+每条时序数据都是由 metric（指标名称），一个或一组label（标签），以及float64的值组成的。
+标准格式为 {=,...}
+例如：
+rpc_invoke_cnt_c{code="0",method="Session.GenToken",job="Center"} 5
+rpc_invoke_cnt_c{code="0",method="Relation.GetUserInfo",job="Center"} 12
+rpc_invoke_cnt_c{code="0",method="Message.SendGroupMsg",job="Center"} 12
+rpc_invoke_cnt_c{code="4",method="Message.SendGroupMsg",job="Center"} 3
+rpc_invoke_cnt_c{code="0",method="Tracker.Tracker.Get",job="Center"} 70
+
+这是一组用于统计RPC接口处理次数的监控数据。
+其中rpc_invoke_cnt_c为指标名称，每条监控数据包含三个标签：code 表示错误码，service表示该指标所属的服务，method表示该指标所属的方法，最后的数字代表监控值。
+针对这个例子，我们共有四个维度（一个指标名称、三个标签），这样我们便可以利用Prometheus强大的查询语言PromQL进行极为复杂的查询。
+
+# TYPE process_cpu_seconds_total counter
+process_cpu_seconds_total 17.72
+
+# TYPE http_response_size_bytes summary
+http_response_size_bytes{handler="prometheus",quantile="0.5"} 3434
+http_response_size_bytes{handler="prometheus",quantile="0.9"} 3463
+http_response_size_bytes{handler="prometheus",quantile="0.99"} 3463
+
+PromQL
+PromQL(Prometheus Query Language) 是 Prometheus 自己开发的数据查询 DSL 语言，语言表现力非常丰富，支持条件查询、操作符，并且内建了大量内置函，供我们针对监控数据的各种维度进行查询。
+我们想统计Center组件Router.Logout的频率，可使用如下Query语句：
+rate(rpc_invoke_cnt_c{method="Relation.GetUserInfo",job="Center"}[1m])
+或者基于方法和错误码统计Center的整体RPC请求错误频率：
+sum by (method, code)(rate(rpc_invoke_cnt_c{job="Center",code!="0"}[1m]))
+如果我们想统计Center各方法的接口耗时，使用如下Query语句即可：
+rate(rpc_invoke_time_h_sum{job="Center"}[1m]) / rate(rpc_invoke_time_h_count{job="Center"}[1m])
+更多的内建函数这里不展开介绍了。函数使用方法和介绍可以详细参见官方文档中的介绍：https://Prometheus.io/docs/querying/functions/
+
+
+100 - (avg by (hostname) (irate(node_cpu{job="node",mode="idle"}[5m])) * 100)
+
+100 - (avg by (hostname) (irate(node_cpu{hostdesc="goocar_ggw",mode="idle"}[5m])) * 100)
+
+irate(node_network_transmit_bytes{instance=~"$server:.*", device!~"lo|bond[0-9]|cbr[0-9]|veth.*"}[5m]) > 0    # {{device}} outbound
+irate(node_network_receive_bytes{instance=~"$server:.*", device!~"lo|bond[0-9]|cbr[0-9]|veth.*"}[5m]) > 0    # {{device}} inbound
+
+IOPS
+sum by (instance) (irate(node_disk_reads_completed{instance=~"$server:.*"}[5m])) # reads per second
+sum by (instance) (irate(node_disk_writes_completed{instance=~"$server:.*"}[5m])) # writes per second
+sum by (instance) (irate(node_disk_io_time_ms{instance=~"$server:.*"}[5m])) # io time
+sum by (instance) (irate(node_disk_reads_completed{instance=~"$server:.*"}[5m])) + sum by (instance) (irate(node_disk_writes_completed{instance=~"$server:.*"}[5m])) # IOPS
+
+
+exporter 使用和开发
+
+
+参考
+https://github.com/xinyu/ansible-projects/tree/master/ansible-promethus
+https://prometheus.io/docs/introduction/overview/
+http://dbaplus.cn/news-72-1462-1.html
+
+
+
+

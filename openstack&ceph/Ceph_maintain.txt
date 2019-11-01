@@ -1,0 +1,326 @@
+
+目录
+
+Ceph维护
+Ceph故障处理
+
+----------------------------------------------------------
+----------------------------------------------------------
+Ceph维护
+----------------------------------------------------------
+----------------------------------------------------------
+
+1. 删除 OSD
+# 移除故障的数据盘 OSD.5
+ceph osd out 5
+systemctl stop ceph-osd@5
+ceph osd crush remove osd.5
+ceph auth del osd.5
+ceph osd rm 5
+
+2. 增加 OSD
+# 增加 ceph03 节点的/data/disk2/(必须为空目录)
+ceph-deploy --overwrite-conf osd create \
+            ceph03:/data/disk2:/dev/disk/by-partlabel/journal02
+ceph-deploy --overwrite-conf osd activate \
+            ceph03:/data/disk2:/dev/disk/by-partlabel/journal02
+ceph-deploy --overwrite-conf config push ceph01 ceph02 ceph03
+
+
+3. 删除 MON
+systemctl stop ceph-mon@ceph03
+ceph mon remove ceph03
+vim ceph.conf
+...
+mon_initial_members = ceph01, ceph02
+mon_host = 192.168.1.81,192.168.1.82
+...
+ceph-deploy --overwrite-conf config push ceph01 ceph02 ceph03
+
+4. 增加 MON
+ceph mon dump
+ceph mon add ceph03 192.168.1.83:6789
+ceph-deploy --overwrite-conf mon create ceph03
+vim ceph.conf
+...
+mon_initial_members = ceph01, ceph02, ceph03
+mon_host = 192.168.1.81,192.168.1.82,192.168.1.83
+...
+ceph-deploy --overwrite-conf config push ceph01 ceph02 ceph03
+
+5. 调整pool复制级别
+$ ceph osd dump | grep ^pool
+$ ceph osd pool set nova size 3
+
+6. ceph osd 数据磁盘文件系统检查修复
+systemctl stop ceph-osd@5
+umount /data/osd5/
+xfs_repair -v -L /dev/sdx
+xfs_repair -n /dev/sdx
+
+7. osd维护模式操作
+ceph osd set noout
+systemctl stop ceph-osd@2
+ceph-osd -i 2 --flush-journal
+mount /dev/sdx /newjournal
+ceph-osd -i 2 --mkjournal 
+ssystemctl start ceph-osd@2
+osd unset noout
+ceph osd tree
+
+8. Ceph placement groups (ceph pg操作)
+$ rados -p mypool ls
+$ ceph osd map mypool object1
+osdmap e105 pool 'mypool' (1) object 'object1' -> pg 1.bac5debc (1.3c) -> up ([4,9], p4) acting ([4,9], p4)
+  object1 belongs to the pg number 1
+  this object is currently stored into the OSD 4 and 9
+$ ls /data/disk5/current/1.3c_head
+$ ceph pg 1.3c query
+
+9. CRUSH操作
+ceph osd pool ls detail
+ceph osd getcrushmap -o ceph-crushmap
+crushtool -d ceph-crushmap -o ceph-crushmap.txt
+vi ceph-crushmap.txt
+Eventually recompile and inject the new CRUSH map:
+crushtool -c ceph-crushmap.txt -o ceph-crushmap
+ceph osd setcrushmap -i ceph-crushmap
+
+rados mkpool ssd
+ceph osd pool set ssd crush_ruleset 3
+
+10. 通过日志分析使用ceph存储的虚拟机IO
+ceph.conf
+[client]
+log file = /var/log/qemu/qemu-guest.$pid.log
+debug rbd = 20
+
+11. 手工修复ceph对象
+ceph health detail
+ceph pg repair 17.1c1
+
+Find the object:
+find /var/lib/ceph/osd/ceph-21/current/17.1c1_head/ -name 'rb.0.90213.238e1f29.00000001232d*' -ls
+
+Fix the problem:
+stop the OSD that has the wrong object responsible for that PG
+flush the journal (ceph-osd -i <id> --flush-journal)
+move the bad object to another location
+start the OSD again
+call ceph pg repair 17.1c1
+
+12. 确认ceph的RBD cache是否激活
+ceph.conf
+[client]
+rbd cache = true
+rbd cache writethrough until flush = true
+
+ceph --admin-daemon /var/run/ceph/ceph-client.admin.66606.140190886662256.asok config show | grep rbd_cache
+
+rbd -p rbd bench-write fio —io-size 4096 —io-threads 256 —io-total 1024000000 —io-pattern seq
+
+13. 平稳下线OSD
+# 先调整weight可以只触发一次数据重新分布，weight根据数据大小可以分步骤逐步降低到0
+ceph osd crush reweight osd.<ID> 0.0
+Then you wait for rebalance to be completed. Eventually completely remove the OSD:
+ceph osd out <ID>
+systemctl stop ceph-osd@<ID>
+ceph osd crush remove osd.<ID>
+ceph auth del osd.<ID>
+ceph osd rm <ID>
+
+14. ceph 集群容量调整
+weight : (osd5 disk / osd1 disk) * 0.2
+ceph osd crush reweight osd.5 0.16
+
+15. ceph osd perf
+OSD 8的磁盘延时较长，所以需要考虑将该OSD剔除出集群
+osd fs_commit_latency(ms) fs_apply_latency(ms)
+  0                    14                   17
+  1                    14                   16
+  2                    10                   11
+  3                     4                    5
+  4                    13                   15
+  5                    17                   20
+  6                    15                   18
+  7                    14                   16
+  8                   299                  329
+
+16. Ceph存储空间回收
+当前只有主流的文件系统，比如Ext4、XFS、Btrfs，支持Trim/Discard操作。
+触发Trim/Discard请求
+有两种方式可以触发Trim/Discard请求，一种是由文件系统自动完成，一种是用户通过执行命令来完成。
+文件系统自动完成
+只要在挂载文件系统时指定discard参数即可，比如 mount -t ext4 -o discard  device mountpoint，这样在文件系统中删除文件后会自动触发Trim/Discard操作，在块设备上释放占用的空间。
+用户执行命令
+用户可以执行命令fstrim来触发Trim/Discard操作，采用这种方式mount文件系统时不需要discard参数。比如，fstrim -v mountpoint，就会释放对应块设备上不用的空间。
+需要注意的是，mount的discard参数会导致文件系统性能下降，在并发删除大量小文件时变得很慢，因此需要根据具体场景选择合适的长发方式。
+
+17. 修复leveldb
+the omap of a Ceph (hammer, jewel) OSD is generally stored in /var/lib/ceph/osd/ceph-$ID/current/omap
+$ python
+...
+>>> import leveldb
+>>> leveldb.RepairDB('')
+
+18. openstack and ceph 整合问题
+考虑添加一些未使用libvirt / images_type = rbd配置的计算节点，而是使用本地磁盘映像。 将这些主机进行主机聚合，并将它们映射到指定的flavor。 选择这种flavor来跑低延迟的应用程序。
+
+19. rbd无法map(rbd feature disable)
+在jewel版本下默认开启了rbd的一些属性
+rbd info mytest
+rbd feature disable rbd/mytest deep-flatten
+rbd feature disable rbd/mytest fast-diff
+rbd feature disable rbd/mytest object-map
+rbd feature disable rbd/mytest exclusive-lock
+
+20. 模拟对象丢失的场景
+rados -p rbd put testremove testremove
+ceph osd map rbd testremove
+写入文件,找到文件，然后去后台删除对象
+然后停止掉其中一个OSD，这里选择停掉主OSD
+systemctl stop ceph-osd@1
+ceph osd out 1
+rados -p rbd get testremove testfile
+前端rados请求会卡住，后端出现 requests are blocked
+如何处理:
+ceph pg 0.27 mark_unfound_lost delete
+rados  -p rbd  get testremove  a
+重启这个卡住的PG所在的osd
+
+21. Ceph集群会出现stale的情况，也就是ceph集群PG的僵死状态
+模拟stale环境，这个比较好模拟
+设置副本2，然后同时关闭两个OSD（不同故障域上），然后删除这两个OSD
+集群这个时候就会出现stale的情况了，因为两份数据都丢了，在一些环境下，数据本身就是临时的或者不是那么重要的，比如存储日志，这样的环境下，只需要快速的恢复环境即可，而不担心数据的丢失
+
+处理过程
+先用ceph pg dump|grep stale 找出所有的stale的pg
+然后用 ceph force_create_pg pg_id
+如果做到这里，可以看到之前的stale的状态的PG，现在已经是creating状态的了，这个时候一个关键的步骤需要做下
+就是重启整个集群的OSD，在重启完成了以后，集群的状态就会恢复正常了，也能够正常的写入新的数据了，对于老的数据，做下清理即可
+
+22. osd wrongly marked down
+osd 内部以及 osd 之间都有心跳检测，如果 osd 内部心跳检测到异常，osd 会将自己杀掉，如果osd 之间心跳检测到异常（网络故障或被检测 osd 内部心跳异常），发起心跳检测的 osd 会上报被检测 osd 的 down 信息给 mon，mon 收到一定数量的 osd down 报告之后，会在 OSDMonitor::check_failure 将被报告的 osd 在 osdmap 中置成 down。（iptables没有放开相关端口和流量也会导致通信问题）
+
+
+常用命令
+ceph -s
+ceph mon_status
+ceph osd stat
+ceph osd tree
+ceph pg stat
+ceph osd dump | awk '{print $1,$14,$15,$16,$17}'
+ceph pg dump -o pg_output.log -f json-pretty
+ceph pg 0.23 query
+ceph df
+rados df
+
+
+----------------------------------------------------------
+----------------------------------------------------------
+故障处理
+----------------------------------------------------------
+----------------------------------------------------------
+
+1. Ceph 运行状况查看
+ceph -s              # 简单状态查看
+ceph health detail   # 详细状态
+ceph report          # 日志
+ceph osd tree        # osd 状态和weight
+ceph quorum_status   # monitor状态
+
+monitor 状态说明：
+probing        正在探测态。这意味着MON正在寻找其他的MON。当MON启动时， MON尝试找在monmap定义的其他剩余的MON。在多MON的集群中，直到MON找到足够多的MON构建法定选举人数之前，它一直在这个状态。这意味着如果3个MON中的2个挂掉，剩余的1个MON将一直在probing状态，直到启动其他的MON中的1个为止。
+electing       正在选举态。这意味着MON正在选举中。这应该很快完成，但有时也会卡在正这，这通常是因为MON主机节点间的时钟偏移导致的。 
+synchronizing   正在同步态。这意味着MON为了加入到法定人数中和集群中其他的MON正在同步。
+leader或peon 领导态或员工态。这不应该出现。然而有机会出现，一般和时钟偏移有很大关系
+时钟偏移
+
+OSD 状态说明：
+up      OSD启动
+down    OSD停止
+in      OSD在集群中
+out     OSD不在集群，默认OSD down 超过300s,Ceph会标记为out，会触发重新平衡操作
+
+
+2. 硬盘故障，平稳下线OSD
+硬盘故障可以通过MegaCli命令查看硬盘状态和media错误计数，media错误计数增长一般需要考虑更换硬盘。
+更换硬盘参考下面步骤将这个OSD下线。
+# 先调整weight可以只触发一次数据重新分布，weight根据数据大小可以分步骤逐步降低到0
+ceph osd crush reweight osd.<ID> 0.0
+Then you wait for rebalance to be completed. Eventually completely remove the OSD:
+ceph osd out <ID>
+systemctl stop ceph-osd@<ID>
+ceph osd crush remove osd.<ID>
+ceph auth del osd.<ID>
+ceph osd rm <ID>
+
+
+3. 进行OSD重启操作，为了避免CRUSH算法重新平衡导致的数据流，需要先设置noout。
+ceph osd set noout      ＃ 重启前设置 noout
+ceph osd unset noout    ＃ 重启后恢复设置
+
+4. OSD闪断
+OSD重启或恢复中后，OSD在peering状态一直闪断。因为IO密集型的任务导致影响心跳检测异常，你可以暂时为集群通过打开nodown noup选项。执行命令：
+ceph set nodown 
+ceph set noup  
+ceph set noout
+当集群健康稳定后，执行如下命令恢复默认值：
+ceph unset nodown  
+ceph unset noup  
+ceph unset noout
+
+5. PG问题处理
+ceph health detail   # PG状态
+正常的PG状态是 100%的active + clean
+
+PG状态：
+active        活跃态。Ceph将处理到这个PG的读写请求
+unactive      非活跃态。PG不能处理读写请求
+clean         干净态。Ceph复制PG内所有对象到设定正确的数目
+unclean       非干净态。PG不能从上一个失败中恢复
+down          离线态。具有必需数据的副本挂掉，比如对象所在的3个副本的OSD挂掉，所以PG离线
+degraded      降级态。Ceph有些对象的副本数目没有达到系统设置，一般是因为有OSD挂掉
+inconsistent  不一致态。Ceph 清理和深度清理后检测到PG中的对象在副本存在不一致，例如对象的文件大小不一致或recovery结束后一个对象的副本丢失
+peering       正在同步态。PG正在执行同步处理
+recovering    正在恢复态。Ceph正在执行迁移或同步对象和他们的副本
+incomplete    未完成态。实际的副本数少于min_size。Ceph检测到PG正在丢失关于已经写操作的信息，或者没有任何健康的副本。如果遇到这种状态，尝试启动失败的OSD，这些OSD中可能包含需要的信息或者临时调整副本min_size的值到允许恢复。
+stale         未刷新态。PG状态没有被任何OSD更新，这说明所有存储这个PG的OSD可能down
+backfilling   正在后台填充态。 当一个新的OSD加入集群后，Ceph通过移动一些其他OSD上的PG到新的OSD来达到新的平衡；这个过程完成后，这个OSD可以处理客户端的IO请求。
+remapped      重新映射态。PG活动集任何的一个改变，数据发生从老活动集到新活动集的迁移。在迁移期间还是用老的活动集中的主OSD处理客户端请求，一旦迁移完成新活动集中的主OSD开始处理。
+
+
+6. PG长时间卡在一些状态
+遇到失败后PG进入如 “degraded” 或 “peering”的状态是正常的。通常这些状态指示失败恢复处理过程中的正常继续。然而，一个PG长时间保持在其中一些状态可能是一个更大问题的提示。因此，MON当PG卡在一个非正常态时会警告。 我们特别地检查：
+inactive ：PG太长时间不在active态，例如PG长时间不能处理读写请求，通常是peering的问题。
+unclean ：PG太长时间不在clean态，例如PG不能完成从上一个失败的恢复，通常是unfound objects导致。
+stale ：PG状态未被OSD更新，表示所有存储PG的OSD可能挂掉，一般启动相应的OSD进程即可。
+在MON节点执行如下命令，可以明确列出卡住的PG：
+ceph pg dump_stuck stale
+ceph pg dump_stuck inactive
+ceph pg dump_stuck unclean
+当一个新Pool被创建后经过一段合理的时间没有达到active+clean状态，这很有可能是么有配置、CRUSH map或者资源太少不足以到达配置的副本级别，这种情况在很多新手测试时容易发生。 例如：
+OSD的数目少于副本数，如集群只有2个OSD但是配置Pool的副本数为3
+集群只有一个Host，但是ruleset 设置的副本选取策略为Host而不是OSD，导致永远无法选取设置的副本数目。你需要修改ruleset中osd crush chooseleaf type的默认值host为osd，这表示PG的OSD可以在同一Host上。
+
+
+7. Ceph清理和深度清理后到PG处于inconsistent态
+ceph health detail  # 检查出错的pg
+HEALTH_ERR 1 pgs inconsistent; 1 scrub errors
+pg 3.66 is active+clean+inconsistent, acting [8,0]
+
+ceph pg repair 3.66 # 修复出错的pg
+
+出现这种不一致的状态，需要确认下硬盘是否有问题需要更换
+dmesg -T | egrep sd[a-z]
+/opt/MegaRAID/MegaCli/MegaCli64 -PDList  -aALL | grep -e '^$' -e Slot -e Count -e state
+
+
+
+
+
+
+
+
+
+

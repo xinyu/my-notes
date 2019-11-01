@@ -1,0 +1,458 @@
+
+安装步骤:
+物理机安装centos7.0步骤
+基于centos7.0的KVM安装步骤
+虚拟机安装配置
+
+-------------------------------------------
+物理机安装centos7.0步骤
+-------------------------------------------
+
+1. 账号密码
+root:passtest
+
+2. dell机器开机按照提示进入raid配置，配置raid5。(dell R730)
+2.1 dell开机按照提示，按ctrl+R进入raid配置界面。
+2.2 按照提示，按F2进入操作菜单，选择“convert to raid capable”，弹出的界面按space键选择磁盘，ok退出。
+2.3 回到VD Mgmt界面，按F2进入操作菜单，选择“create new vd”，raid level按space键选择raid5，physical disks选择物理硬盘，最少三个盘组成raid5. vd name输入vd1。选择ok退出。
+2.4 回到VD Mgmt界面，选择virtual disks下的虚拟磁盘，按F2进行初始化，选择fast init即可。
+2.5 按ESC键退出，重启系统。插入centos安装光盘。
+
+3. 通过centos7安装盘进行操作系统安装。
+3.1 语言和键盘全部选择english。
+3.2 安装选项。
+INSTALL SUMMARY界面，SOFTWARE SELEECTION默认最小安装即可。
+
+INSTALLATION DESTINATION选择硬盘，下面的分区选项选择自定义。
+分区信息：
+/boot  500M
+/home  100G
+/      100G
+/data  剩余
+swap   40G  ＃ swap注意device type选择standard partition。
+
+NETWORK&HOSTNAME的em2启用，注意网线也插入em2接口，em1接外网。
+启用网络后，DHCP获取到IP，装完基本系统，后面就可以远程登录进行下面的安装配置。
+
+接下来的安装过程的界面可以设置root登录密码:passtest
+
+基础操作系统安装完成进入系统进行相关安装配置。
+4. 网络配置
+外网IP和内网IP:
+100.100.100.101 192.168.1.100 (虚拟机IP: 192.168.1.101~192.168.1.104)
+
+# vi /etc/sysconfig/network-scripts/ifcfg-em1 # em1配置外网IP
+NAME=em1
+TYPE=Ethernet
+NM_CONTROLLED=no
+BOOTPROTO=static
+IPADDR=100.100.100.101
+PREFIX=26
+GATEWAY=100.100.100.1
+DEFROUTE=yes
+PEERDNS=yes
+PEERROUTES=yes
+IPV4_FAILURE_FATAL=yes
+IPV6INIT=no
+ONBOOT=yes
+
+# vi /etc/sysconfig/network-scripts/ifcfg-em2 ＃ em2配置内网IP，在测试安装时这个ip注意先ping一下没有使用的，测试环境安装可以先dhcp获取，最后再修改回生产环境的IP地址。
+NAME=em2
+TYPE=Ethernet
+NM_CONTROLLED=no
+BOOTPROTO=static
+IPADDR=192.168.1.100
+NETMASK=255.255.255.0
+DEFROUTE=yes
+PEERDNS=yes
+PEERROUTES=yes
+IPV4_FAILURE_FATAL=yes
+IPV6INIT=no
+ONBOOT=yes
+GATEWAY=192.168.1.1
+DNS1=192.168.1.1
+
+hostname:
+# vi /etc/hostname
+host100.test.net
+# vi /etc/hosts
+192.168.1.100 host100 host100.test.net
+
+网络工具安装(安装后可以通过ifconfig查看网络配置，不安装用"ip addr"查看):
+# yum install net-tools
+
+5. 系统升级
+# yum install epel-release  # 配置实用epel的源
+# yum update
+# yum upgrade
+# yum clean all
+# reboot
+
+6. 时间同步
+# timedatectl set-timezone Asia/Shanghai
+
+# yum install ntp
+
+# systemctl start ntpd 
+# systemctl enable ntpd
+
+7. 创建用户
+# useradd test; echo -e "56KWeTK63zpXK1rm\n56KWeTK63zpXK1rm" | passwd test
+
+# usermod -G wheel test
+
+8. 配置sudo
+# sed -i '/auth.*required.*pam_wheel.so use_uid/s/#//' /etc/pam.d/su
+# echo -e "SU_WHEEL_ONLY\tyes" >> /etc/login.defs
+# sed -i 's#.*%wheel.*NOPASSWD.*# %wheel\t\tALL=(ALL)\tNOPASSWD: ALL,!/usr/bin/passwd,!/bin/su#' /etc/sudoers      # 禁止sudo使用passwd和su命令
+# sed -i 's/Defaults    requiretty/#Defaults    requiretty/' /etc/sudoers
+
+9. 配置coredump
+# mkdir /var/coredump
+# chmod 777 /var/coredump
+# echo "ulimit -c 1024" >> /home/test/.bash_profile
+
+10. 停用 firewalld, 改用 iptabless
+# systemctl stop firewalld
+# systemctl disable firewalld
+# yum install iptables-services
+
+# iptables -F
+# iptables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT 
+# iptables -A INPUT -p icmp -j ACCEPT 
+# iptables -A INPUT -i lo -j ACCEPT 
+# iptables -A INPUT -p tcp -m tcp --dport 2222 -j ACCEPT 
+# iptables -A INPUT -j REJECT --reject-with icmp-host-prohibited 
+# iptables -A FORWARD -j REJECT --reject-with icmp-host-prohibited
+# service iptables save
+
+# systemctl start iptables
+# systemctl enable iptables
+# systemctl status iptables
+
+11. ssh配置
+# sed -i 's/.*UseDNS.*/UseDNS no/' /etc/ssh/sshd_config
+# sed -i 's/GSSAPIAuthentication  *yes/GSSAPIAuthentication no/' /etc/ssh/ssh_config
+# sed -i 's/#Port 22/Port 2222/' /etc/ssh/sshd_config
+# sed -i 's/#PermitRootLogin yes/PermitRootLogin no/' /etc/ssh/sshd_config
+
+SELinux安全策略配置
+# https://www.liberiangeek.net/2014/11/change-openssh-port-centos-7/
+# yum -y install policycoreutils-python
+# semanage port -a -t ssh_port_t -p tcp 2222
+# semanage port -l | grep ssh
+ssh_port_t                     tcp      2222, 22
+
+# systemctl restart sshd
+# systemctl restart network
+
+12. 给文件系统挂载的时候加上 noatime 参数能提高文件系统性能：
+# vi /etc/fstab
+/dev/mapper/centos-root /                       xfs     defaults,noatime        1 1
+UUID=bdf2989f-9260-4fda-9e4f-3a56c0f12350 /boot                   xfs     defaults        1 2
+/dev/mapper/centos-data /data                   xfs     defaults,noatime        1 2
+/dev/mapper/centos-home /home                   xfs     defaults,noatime        1 2
+/dev/mapper/centos-swap swap                    swap    defaults        0 0
+
+# mount -o remount /
+# mount -o remount /data
+# mount -o remount /home
+
+13. 修改打开文件句柄最大数：
+# cat <<EOF >>/etc/security/limits.conf
+*   soft    nofile  1024000
+*   hard    nofile  1024000
+
+*   soft    nproc   102400
+*   hard    nproc   102400
+EOF
+
+# vi /etc/security/limits.d/90-nproc.conf   # 加入下面内容
+# Default limit for number of user's processes to prevent
+# accidental fork bombs.
+# See rhbz #432903 for reasoning.
+
+*          soft    nproc     10240
+
+
+14. 内核参数调整：
+# cat <<EOF >>/etc/sysctl.conf
+net.ipv4.ip_local_port_range = 1024  65535
+net.ipv4.tcp_synack_retries = 1
+net.ipv4.tcp_syn_retries = 1
+net.ipv4.route.max_size = 4096000
+net.core.somaxconn = 8192
+net.ipv4.tcp_tw_recycle = 0
+net.ipv4.tcp_syncookies = 0
+net.ipv4.tcp_mem = 7864320 10485760 15728640
+net.core.wmem_max = 8732000
+net.core.rmem_max = 8732000
+net.ipv4.tcp_wmem = 81920 4366000 8732000
+net.ipv4.tcp_rmem = 327680 4366000 8732000
+net.ipv4.tcp_max_syn_backlog = 819200
+net.netfilter.nf_conntrack_max = 655360
+kernel.core_pattern = /var/coredump/core-%e-%p-%t
+EOF
+
+# sysctl -p
+
+
+15. 停止postfix服务并去掉开机启动
+# systemctl stop postfix.service
+# systemctl disable postfix.service
+
+16. 检查是否有失败的服务
+# systemctl --failed
+
+17. 安装iftop等
+# yum install iftop mlocate iptraf dstat strace lrzsz file MySQL-python libselinux-python
+# yum install telnet rpm ncurses-devel make gcc-c++ openssl-devel perl-DBD-MySQL perl-Time-HiRes
+
+
+-------------------------------------------
+基于centos7.0的KVM安装步骤
+-------------------------------------------
+1. 确认cpu是否支持虚拟化。
+# grep -E 'svm|vmx' /proc/cpuinfo
+有svm或者vmx输出表示cpu支持虚拟化。
+
+2. 安装和启动KVM。
+# yum install qemu-kvm libvirt libvirt-python libguestfs-tools virt-install virt-viewer
+
+# systemctl enable libvirtd && systemctl start libvirtd
+
+查看kvm服务是否正常，目前没任何虚拟机，所以没有内容显示。
+# virsh -c qemu:///system list
+
+3. 物理机网络配置。
+3.1 修改物理机内网网络配置文件，设置“br0”桥接网络。
+# vi /etc/sysconfig/network-scripts/ifcfg-em2
+DEVICE=em2
+BOOTPROTO=none
+ONBOOT=yes
+BRIDGE=br0
+NM_CONTROLLED=no
+
+3.2 创建/etc/sysconfig/network-scripts/ifcfg-br0网络配置。
+# vi /etc/sysconfig/network-scripts/ifcfg-br0
+DEVICE=br0
+TYPE=Bridge
+BOOTPROTO=static
+BROADCAST=192.168.1.255
+IPADDR=192.168.1.101
+NETMASK=255.255.255.0
+ONBOOT=yes
+DELAY=0
+NM_CONTROLLED=no
+IPV6INIT=yes
+IPV6_AUTOCONF=yes
+GATEWAY=192.168.1.1
+DNS1=192.168.1.1
+
+3.3 Enable network forwarding。
+# vi /etc/sysctl.conf
+net.ipv4.ip_forward = 1
+And read the file:
+# sysctl -p /etc/sysctl.conf
+
+3.4 重启网络服务。
+# systemctl restart network
+
+3.5 查看创建的桥接网络。
+# brctl show
+
+4. SELinux启用需要修改安全配置。
+# mkdir -p /data/vms   ＃kvm虚拟机镜像目录
+# yum -y install policycoreutils-python # 安装策略配置工具
+# semanage fcontext --add -t virt_image_t '/data/vms(/.*)?' # 添加kvm虚拟机镜像目录支持
+# semanage fcontext -l | grep virt_image_t  ＃ 确认添加成功
+
+5. 创建虚拟机。
+5.1 准备好iso
+# ls /data
+  CentOS-6.6-x86_64-bin-DVD1.iso
+
+5.2 Creating VMs
+# virt-install \
+    --network bridge:br0 \
+    --name vm_101 \
+    --ram=40960 \
+    --vcpus=8 \
+    --disk path=/data/vms/vm_101.img,size=100 \
+    --graphics vnc,password=1509prod,listen=0.0.0.0,port=5910 \
+    --cdrom /data/CentOS-6.6-x86_64-bin-DVD1.iso \
+    --force  --autostart
+
+5.3 连接虚拟机进行操作系统安装。
+通过VNC客户端连接5.2中指定的VNC端口。
+
+6. Cloning VMs
+# virsh suspend vm_101
+# virt-clone \
+    --connect qemu:///system \
+    --original vm_101 \
+    --name vm1-clone \
+    --file /data/vms/vm1-clone.img
+# virsh resume vm_101
+# virsh start centos66-vm1-clone
+
+7. KVM静态迁移
+先从远程主机上将已经做好的虚拟机镜像文件拷贝到本机，这里假定是1.99主机。
+# cd /data/vms
+# scp test@192.168.1.99:/data/kvm/template2_kvm.tar.gz ./
+# tar zxvf template2_kvm.tar.gz
+
+# cp template2_kvm/vm2-clone.xml /etc/libvirt/qemu/vm_101.xml
+# mv template2_kvm/vm2-clone.img ./vm_101.img
+
+# vi /etc/libvirt/qemu/vm_101.xml
+修改 <name>vm2-clone</name> 为 <name>vm_101</name>
+修改 <source file='/data/vms/vm2-clone.img'/> 为 <source file='/data/vms/vm_101.img'/>
+
+执行下列命令完成KVM虚拟机的define和启动
+# virsh define /etc/libvirt/qemu/vm_101.xml
+# virsh start vm_101
+
+启动后连接虚拟机：
+# virsh console vm_101  # enter键进入虚拟机，跳转到最后一部分“虚拟机安装配置”
+
+# ctrl + ]  # exit
+
+8. Managing VMs
+8.1 List all VMs on a host, running or otherwise:
+# virsh list --all
+
+8.2 Show VM information:
+# virsh dominfo vm1
+
+8.3 Show VCPU/memory usage for all running VMs:
+# virt-top
+
+8.4 Show VM disk partitions (will take a few moments):
+# virt-df vm1
+
+8.5 Stop a VM (shutdown the OS):
+# virsh shutdown vm1
+
+8.6 Start VM:
+# virsh start vm1
+
+8.7 Mark VM for autostart (VM will start automatically after host reboots):
+# virsh autostart vm1
+
+8.8 Mark VM for manual start (VM will not start automatically after host reboots):
+# virsh autostart –disable vm1
+
+8.9 连接虚拟机的控制台
+# virsh console vm1
+# ctrl + ]  # exit
+Note: 
+For a RHEL VM, append the following parameters to the kernel boot line in /etc/grub.conf
+and then reboot the VM:
+console=tty0 console=ttyS0,115200
+
+8.10 通过VNC连接时查询VNC端口
+＃ netstat -nulpt | grep vnc
+＃ virsh vncdisplay vm1
+
+9. 修改虚拟机配置。
+# virsh shutdown vm1
+# virsh edit vm1
+# virsh create /etc/libvirt/qemu/vm1.xml
+# virsh dominfo vm1 | grep memory
+# virsh setmem vm1 2097152 # 动态修改内存
+
+10. 增加kvm磁盘
+# virsh attach-disk vm1 /dev/sdb vdb --driver qemu --mode shareable # 增加磁盘
+vdb is the device name you want to map to inside the VM
+you can mount your device to more than one VM at a time, but be careful as there is no write 
+access control here.
+
+# virsh detach-disk vm1 vdb # 删除磁盘
+
+11. KVM下关闭virbr0（桥接网络时不需要这个默认的网络连接）。
+# virsh net-destroy default
+# virsh net-undefine default
+# systemctl restart libvirtd
+
+
+-------------------------------------------
+虚拟机安装配置
+-------------------------------------------
+
+通过上面的8.9步骤中的命令连接到虚拟机进行配置。
+1. 网络配置。
+# rm /etc/udev/rules.d/70-persistent-net.rules # 从clone的虚拟机镜像启动的虚拟机需要先删除此文件
+# reboot
+# cd /etc/sysconfig/network-scripts
+# mv ifcfg-eth0 ifcfg-eth1  # 从clone的虚拟机镜像启动的虚拟机需要修改eth0为eht1。
+# vi ifcfg-eth1
+DEVICE=eth1   # 注意，修改eth0为eth1
+HWADDR=52:54:00:D6:B6:B0  # mac地址修改为“cat /etc/udev/rules.d/70-persistent-net.rules”中address。
+TYPE=Ethernet
+UUID=fcee0c7f-4dd2-4f08-9584-ebf93e74faf2
+ONBOOT=yes
+NM_CONTROLLED=no
+BOOTPROTO=static
+IPADDR=192.168.1.101
+NETMASK=255.255.255.0
+GATEWAY=192.168.1.1
+DNS1=192.168.1.1
+
+# service network restart
+
+2. hostname配置。
+# vi /etc/sysconfig/network  你需要加入一行，记住HOSTNAME,必须大写。
+NETWORKING=yes
+HOSTNAME=test101
+
+# vi /etc/hosts
+192.168.1.101   test101.test.net   test101
+# reboot
+
+3. 更新当前系统。
+# yum update
+# yum upgrade
+
+4. 内核更新(uname -r, 内核版本是3.12.38及以上版本的不需要升级)。
+4.1 下载源码包:
+# curl -O https://www.kernel.org/pub/linux/kernel/v3.x/linux-3.12.38.tar.xz
+# yum install xz
+# tar -xf linux-3.12.38.tar.xz
+
+4.2 安装编译内核所需要的软件包:
+# yum groupinstall "Development Tools"
+# yum install ncurses-devel #必须这样才能让 make *config 这个指令正确地执行。
+# yum install hmaccalc zlib-devel binutils-devel elfutils-libelf-devel #创建 CentOS-6 内核时需要它们
+
+4.3 将当前系统的配置文件拷贝到当前目录:
+# uname -r
+2.6.32-504.el6.x86_64
+# cp /boot/config-2.6.32-504.el6.x86_64 .config
+
+4.4 使用旧内核配置，并自动接受每个新增选项的默认设置:
+# sh -c 'yes "" | make oldconfig'
+
+4.5 编译:
+# make -j8 bzImage #生成内核文件
+# make -j8 modules #编译模块
+# make -j8 modules_install #编译安装模块
+
+4.6 安装:
+# make install
+
+4.7 修改Grub引导顺序:
+# vi /etc/grub.conf # 数一下刚刚新安装的内核在哪个位置，从0开始，然后设置default为那个数字，一般新安装的内核在第一个位置，所以设置default=0。
+
+4.8 重启:
+# reboot
+
+4.9 如果失败，则重新循环:
+# make mrproper # 清理上次编译的现场
+
+
+参考：
+http://www.esojourn.org/blog/post/centos6-kvm-installation-with-apache-reverse-proxy.php
+http://linux.dell.com/files/whitepapers/KVM_Virtualization_in_RHEL_7_Made_Easy.pdf
+http://jensd.be/?p=207
+

@@ -1,0 +1,640 @@
+
+ELK + Kafka: 
+ELK is a popular open sourced application stack for visualizing and analyzing logs. 
+ELK is currently being used across many teams within LinkedIn. 
+The architecture we use is made up of four components: Elasticsearch, Logstash(Filebeat), Kibana and Kafka. 
+Elasticsearch: Distributed real-time search and analytics engine
+Logstash: Collect and parse all data sources into an easy-to-read JSON format
+Kibana: Elasticsearch data visualization engine
+Kafka: Data transport, queue, buffer and short term storage
+  Dedicated cluster for logs in each data center
+  Individual topics per application
+  Defaults to 4 days of transport level retention
+  Not currently replicating between data centers
+  Common logging transport for all services, languages and frameworks
+
+
+数据采集: filebeat部署到业务节点，采集业务日志数据上报到Kafka集群
+          每个主机部署一个
+数据缓存: filebeat将采集的日志转存到kafka broker+zookeeper集群
+          zookeeper+kafka至少各部署三个，三个kafka（kafka的数据分片配置为6，每个kafka两个分片）
+数据转发: Logstash实时从kafka broker集群拉数据，转发至elasticsearch-data节点
+         logstash 按 topic 部署，根据topic消息量每topic一个logstash或者多个topic一个logstash
+数据索引: elasticsearch-data节点会把收到的数据，写磁盘，建索引库
+          数据节点可以根据数据规模横向扩容，这里部署两个
+数据展示: elasticsearch-master+Kibana协调elasticsearch集群，处理数据检索请求，数据展示
+          展示节点这里部署一个作为master
+
+host-1  elasticsearch(master)+Kibana  zookeeper(master)+kafka(shard-1)  logstash(topic-1)
+host-2  elasticsearch(data)           zookeeper(slave)+kafka(shard-2)   logstash(topic-2)
+host-3  elasticsearch(data)           zookeeper(slave)+kafka(shard-2)   logstash(topic-3)
+
+
+------------------------------------------------------------
+------------------------------------------------------------
+
+Initial Server Setup with CentOS 7
+ELK Server : OS: CentOS 7
+             RAM: 4GB
+             CPU: 2
+
+Prepare the Operating System
+
+systemctl disable NetworkManager
+systemctl stop NetworkManager
+chkconfig network on
+systemctl restart network
+
+cd /etc/yum.repos.d
+curl -O http://192.168.1.99/repos/CentOS-Base.repo
+
+yum clean all
+yum repolist
+
+yum -y update
+
+systemctl stop chronyd.service
+systemctl disable chronyd.service
+yum erase -y chrony
+rm -f /etc/chrony*
+
+yum install net-tools sysstat tcpdump wget ntp ntpdate -y
+
+sed -i -e 's/=enforcing/=disabled/g' /etc/sysconfig/selinux
+sed -i -e 's/=enforcing/=disabled/g' /etc/selinux/config
+
+systemctl stop firewalld
+systemctl disable firewalld
+
+systemctl stop postfix.service
+systemctl disable postfix.service
+
+timedatectl set-timezone Asia/Shanghai
+
+systemctl enable ntpd
+systemctl start ntpd
+ntpq -p  # Verify operation
+
+vi /etc/sysconfig/kernel   
+  # MAKEDEBUG=yes
+awk -F\' '$1=="menuentry " {print i++ " : " $2}' /etc/grub2.cfg
+grub2-mkconfig -o /boot/grub2/grub.cfg
+
+reboot
+
+cd /etc/yum.repos.d
+curl -O http://192.168.1.99/repos/epel.repo
+yum clean all
+yum makecache
+
+vi /etc/hosts 
+10.10.1.30 host-1
+10.10.1.31 host-2
+10.10.1.32 host-3
+
+
+------------------------------------------------------------
+------------------------------------------------------------
+Install Java 8
+
+cd ~
+curl -O http://192.168.1.99/tools/jdk-8u91-linux-x64.rpm
+yum -y localinstall jdk-8u91-linux-x64.rpm
+java -version
+
+
+------------------------------------------------------------
+------------------------------------------------------------
+Install Elasticsearch
+
+rpm --import http://192.168.1.99/tools/GPG-KEY-elasticsearch
+wget http://192.168.1.99/tools/elasticsearch-5.5.2.rpm
+rpm -ivh elasticsearch-5.5.2.rpm
+
+vi /etc/elasticsearch/elasticsearch.yml
+bootstrap.memory_lock: true # disables memory swapping for Elasticsearch
+network.host: 0.0.0.0
+http.port: 9200
+
+vi /usr/lib/systemd/system/elasticsearch.service
+LimitMEMLOCK=infinity
+
+vi /etc/sysconfig/elasticsearch
+MAX_LOCKED_MEMORY=unlimited
+
+systemctl daemon-reload
+# systemctl start elasticsearch
+systemctl enable elasticsearch
+
+
+系统调优，JVM调优
+# 配置系统最大打开文件描述符数
+vi /etc/sysctl.conf
+fs.file-max=65535
+ 
+# 配置进程最大打开文件描述符
+vi /etc/security/limits.conf
+# End of file
+* soft nofile 65535
+* hard nofile 65535
+ 
+
+mkdir -p /data/elasticsearch/data
+mkdir -p /var/log/elasticsearch
+chown -R elasticsearch:elasticsearch /data/elasticsearch
+chown -R elasticsearch:elasticsearch /var/log/elasticsearch
+
+# ES 集群配置
+vi /etc/elasticsearch/elasticsearch.yml
+ 
+# ---------------------------------- Cluster -----------------------------------
+# Use a descriptive name for your cluster:
+ 
+cluster.name: test
+ 
+# ------------------------------------ Node ------------------------------------
+node.name: host-1
+node.master: true
+node.data: false
+ 
+# ----------------------------------- Index ------------------------------------
+index.number_of_shards: 5
+index.number_of_replicas: 0
+index.refresh_interval: 120s
+ 
+# ----------------------------------- Paths ------------------------------------
+path.data: /data/elasticsearch/data
+ 
+path.logs: /var/log/elasticsearch
+ 
+# ----------------------------------- Memory -----------------------------------
+bootstrap.mlockall: true
+indices.fielddata.cache.size: 50mb
+ 
+#------------------------------------ Network And HTTP --------------------------
+network.host: 0.0.0.0
+http.port: 9200
+ 
+# ------------------------------------ Translog ----------------------------------
+index.translog.flush_threshold_ops: 50000
+ 
+# --------------------------------- Discovery ------------------------------------
+discovery.zen.minimum_master_nodes: 1
+discovery.zen.ping.timeout: 200s
+discovery.zen.fd.ping_timeout: 200s
+discovery.zen.fd.ping.interval: 30s
+discovery.zen.fd.ping.retries: 6
+discovery.zen.ping.unicast.hosts: ["host-1:9300","host-2:9300","host-3:9300",]
+discovery.zen.ping.multicast.enabled: false
+ 
+# --------------------------------- merge ------------------------------------------
+indices.store.throttle.max_bytes_per_sec: 100mb
+
+
+ES DataNode节点
+安装和系统调优方法同上，插件不用安装，只是配置文件不同。
+配置文件
+# ---------------------------------- Cluster -----------------------------------
+# Use a descriptive name for your cluster:
+ 
+cluster.name: test
+ 
+# ------------------------------------ Node ------------------------------------
+node.name: host-2
+node.master: false
+node.data: true
+ 
+# ----------------------------------- Index ------------------------------------
+index.number_of_shards: 5
+index.number_of_replicas: 0
+index.refresh_interval: 120s
+ 
+# ----------------------------------- Paths ------------------------------------
+path.data: /data/elasticsearch/data
+ 
+path.logs: /var/log/elasticsearch/elasticsearch.log
+
+# ----------------------------------- Memory -----------------------------------
+bootstrap.mlockall: true
+indices.fielddata.cache.size: 50mb
+ 
+#------------------------------------ Network And HTTP --------------------------
+network.host: 0.0.0.0
+http.port: 9200
+ 
+# ------------------------------------ Translog ----------------------------------
+index.translog.flush_threshold_ops: 50000
+ 
+# --------------------------------- Discovery ------------------------------------
+discovery.zen.minimum_master_nodes: 1
+discovery.zen.ping.timeout: 200s
+discovery.zen.fd.ping_timeout: 200s
+discovery.zen.fd.ping.interval: 30s
+discovery.zen.fd.ping.retries: 6
+discovery.zen.ping.unicast.hosts: ["host-1:9300","host-2:9300","host-3:9300",]
+discovery.zen.ping.multicast.enabled: false
+ 
+# --------------------------------- merge ------------------------------------------
+indices.store.throttle.max_bytes_per_sec: 100mb
+
+
+ES节点已经准备就绪，分别启动服务
+systemctl start elasticsearch
+
+查看集群状态
+curl http://host-1:9200/?pretty
+
+
+Then check the memory lock to ensure that mlockall is enabled, and check that Elasticsearch is running with the commands below.
+curl -XGET 'localhost:9200/_nodes?filter_path=**.mlockall&pretty'
+curl -XGET 'localhost:9200/?pretty'
+
+
+------------------------------------------------------------
+------------------------------------------------------------
+install ZooKeeper
+
+1. 安装，配置 zookeeper
+http://zookeeper.apache.org/
+
+# 安装JDK
+ 
+# 解压程序
+cd /opt
+wget http://192.168.1.99/tools/zookeeper-3.4.9.tar.gz
+tar zxf zookeeper-3.4.9.tar.gz
+
+2. 配置文件
+mkdir /var/zookeeper
+
+# conf/zoo.cfg
+cp zoo_sample.cfg zoo.cfg
+ 
+# The number of milliseconds of each tick
+tickTime=2000
+# The number of ticks that the initial 
+# synchronization phase can take
+initLimit=10
+# The number of ticks that can pass between 
+# sending a request and getting an acknowledgement
+syncLimit=5
+# the directory where the snapshot is stored.
+# do not use /tmp for storage, /tmp here is just 
+# example sakes.
+dataDir=/var/zookeeper
+# the port at which the clients will connect
+clientPort=2181
+# the maximum number of client connections.
+# increase this if you need to handle more clients
+#maxClientCnxns=60
+ 
+server.1=host-1:2888:3888
+server.2=host-2:2888:3888
+server.3=host-3:2888:3888
+ 
+# Be sure to read the maintenance section of the 
+# administrator guide before turning on autopurge.
+#
+# http://zookeeper.apache.org/doc/current/zookeeperAdmin.html#sc_maintenance
+#
+# The number of snapshots to retain in dataDir
+# autopurge.snapRetainCount=3
+# Purge task interval in hours
+# Set to "0" to disable auto purge feature
+# autopurge.purgeInterval=1
+
+3. 同步配置文件到其他两台节点
+注: zookeeper 集群，每个节点的配置文件都是一样的。所以直接同步过去，不需要做任何修改。
+scp zoo.cfg host-2:/opt/zookeeper-3.4.9/conf/
+scp zoo.cfg host-3:/opt/zookeeper-3.4.9/conf/
+
+4. 创建myid文件
+# host-1
+echo 1 > /var/zookeeper/myid
+ 
+# host-2
+echo 2 > /var/zookeeper/myid
+ 
+# host-3
+echo 3 > /var/zookeeper/myid
+
+5. 启动服务 & 查看节点状态
+# host-1
+bin/zkServer.sh start
+bin/zkServer.sh status
+ 
+ZooKeeper JMX enabled by default
+Using config: /opt/zookeeper-3.4.9/bin/../conf/zoo.cfg
+Mode: leader
+ 
+# host-2
+bin/zkServer.sh start
+bin/zkServer.sh status
+  
+ZooKeeper JMX enabled by default
+Using config: /opt/zookeeper-3.4.9/bin/../conf/zoo.cfg
+Mode: follower
+ 
+# host-3
+bin/zkServer.sh start 
+bin/zkServer.sh status
+ 
+ZooKeeper JMX enabled by default
+Using config: /opt/zookeeper-3.4.9/bin/../conf/zoo.cfg
+Mode: follower
+
+
+------------------------------------------------------------
+------------------------------------------------------------
+install Kafka broker
+
+1. 安装，配置 kafka
+# 解压程序
+cd /opt
+wget http://192.168.1.99/tools/kafka_2.11-0.11.0.1.tgz
+tar zxf kafka_2.11-0.11.0.1.tgz
+
+# replace localhost to 192.168.xx.xx
+cd /opt/kafka_2.11-0.11.0.1
+grep localhost config/*
+
+配置文件
+mkdir /data/kafka-logs
+
+config/server.properties
+############################# Server Basics #############################
+broker.id=1
+ 
+############################# Socket Server Settings #############################
+ 
+num.network.threads=3
+ 
+# The number of threads doing disk I/O
+num.io.threads=8
+ 
+# The send buffer (SO_SNDBUF) used by the socket server
+socket.send.buffer.bytes=102400
+ 
+# The receive buffer (SO_RCVBUF) used by the socket server
+socket.receive.buffer.bytes=102400
+ 
+# The maximum size of a request that the socket server will accept (protection against OOM)
+socket.request.max.bytes=104857600
+ 
+############################# Log Basics #############################
+ 
+log.dirs=/data/kafka-logs
+ 
+num.partitions=6
+ 
+num.recovery.threads.per.data.dir=1
+ 
+############################# Log Flush Policy #############################
+ 
+# The number of messages to accept before forcing a flush of data to disk
+#log.flush.interval.messages=10000
+ 
+# The maximum amount of time a message can sit in a log before we force a flush
+#log.flush.interval.ms=1000
+ 
+############################# Log Retention Policy #############################
+ 
+log.retention.hours=60
+ 
+log.segment.bytes=1073741824
+ 
+log.retention.check.interval.ms=300000
+ 
+############################# Zookeeper #############################
+ 
+zookeeper.connect=host-1:2181,host-2:2181,host-3:2181
+ 
+zookeeper.connection.timeout.ms=6000
+
+注: 其他两个节点的配置文件也基本相同，只有一个参数需要修改 broker.id 。 它用于唯一标识节点，所以绝对不能相同，不然会节点冲突。
+
+同步配置文件到其他两台节点
+scp server.properties host-2:/opt/kafka_2.11-0.11.0.1/config/
+scp server.properties host-3:/opt/kafka_2.11-0.11.0.1/config/
+ 
+# 修改 broker.id
+# host-2
+broker.id=2
+ 
+# host-3
+broker.id=3
+
+
+2. 启动服务 
+nohup bin/kafka-server-start.sh config/server.properties &
+
+# 其他两台节点启动方式相同
+
+Kafka+ZooKeeper集群配置完成
+
+------------------------------------------------------------
+------------------------------------------------------------
+配置数据采集层，业务服务器部署 Filebeat
+
+
+rpm --import http://192.168.1.99/tools/GPG-KEY-elasticsearch
+
+wget http://192.168.1.99/tools/filebeat-5.5.2-x86_64.rpm
+rpm -ivh filebeat-5.5.2-x86_64.rpm
+
+vi /etc/filebeat/filebeat.yml
+filebeat.prospectors:
+- input_type: log
+  paths:
+    - /var/log/secure
+    - /var/log/messages
+
+  document_type: messages
+
+- input_type: log
+  paths:
+    - /var/log/audit/audit.log
+
+  document_type: audit
+
+- input_type: log
+  paths:
+    - /data/nginx/logs/elk.test.net.log
+
+  document_type: nginx-elk
+
+# output to kafka
+output.kafka:
+  # initial brokers for reading cluster metadata
+  hosts: ["kafka1:9092", "kafka2:9092", "kafka3:9092"]
+
+  # message topic selection + partitioning
+  topic: '%{[type]}'
+  partition.round_robin:
+    reachable_only: false
+
+  required_acks: 1
+  compression: gzip
+  max_message_bytes: 1000000
+
+
+systemctl start filebeat
+systemctl enable filebeat
+
+
+Test:
+bin/kafka-console-consumer.sh --zookeeper localhost:2181 --topic messages --from-beginning
+
+------------------------------------------------------------
+------------------------------------------------------------
+logstash 安装配置
+
+1. 安装配置
+wget http://192.168.1.99/tools/logstash-5.5.2.rpm
+rpm -ivh logstash-5.5.2.rpm
+
+配置文件
+kafka-nginx-tests3.conf 
+input {
+  kafka {
+    bootstrap_servers => "kafka1:9092,kafka2:9092,kafka3:9092"
+    topics => ["nginx-tests3", "syslog"]
+    decorate_events => true
+  }
+}
+
+filter {
+  if [kafka][topic] == "nginx-tests3" {
+    grok {
+      match => { "message" => ["%{IPORHOST:[nginx][access][remote_ip]} - %{DATA:[nginx][access][user_name]} \[%{HTTPDATE:[nginx][access][time]}\] \\\"%{WORD:[nginx][access][method]} %{DATA:[nginx][access][url]} HTTP/%{NUMBER:[nginx][access][http_version]}\\\" %{NUMBER:[nginx][access][response_code]} %{NUMBER:[nginx][access][body_sent][bytes]}  %{NUMBER:[nginx][access][request_time]} %{NUMBER:[nginx][access][respones_time]} \\\"%{DATA:[nginx][access][referrer]}\\\" \\\"%{DATA:[nginx][access][agent]}"] }
+ 
+      add_tag => ["nginx-tests3"]
+    }
+  } else if [kafka][topic] == "syslog" {
+    grok {
+      match => { "message" => "%{SYSLOGTIMESTAMP:syslog_timestamp} %{SYSLOGHOST:syslog_hostname} %{DATA:syslog_program}(?:\[%{POSINT:syslog_pid}\])?: %{GREEDYDATA:syslog_message}" }
+      add_field => [ "received_at", "%{@timestamp}" ]
+      add_field => [ "received_from", "%{host}" ]
+
+      add_tag => ["syslog"]
+    }
+    date {
+      match => [ "syslog_timestamp", "MMM  d HH:mm:ss", "MMM dd HH:mm:ss" ]
+    }
+  }
+}
+
+output {
+  if [kafka][topic] == "nginx-tests3" {
+    elasticsearch {
+      hosts => ["localhost:9200"]
+      index => "nginx-tests3-%{+YYYY.MM.dd}"
+    }
+  } else if [kafka][topic] == "syslog" {
+    elasticsearch {
+      hosts => ["localhost:9200"]
+      index => "syslog-%{+YYYY.MM.dd}"
+    }
+  }
+}
+
+2. 启动服务
+systemctl enable logstash
+systemctl start logstash
+
+------------------------------------------------------------
+------------------------------------------------------------
+Install Kibana
+
+wget http://192.168.1.99/tools/kibana-5.5.2-x86_64.rpm
+rpm -ivh kibana-5.5.2-x86_64.rpm
+
+vi /etc/kibana/kibana.yml
+server.port: 5601
+server.host: "localhost"   # Nginx reverse proxy on the same server to allow external access
+elasticsearch.url: "http://localhost:9200"
+
+systemctl start kibana
+systemctl enable kibana
+
+
+
+
+------------------------------------------------------------
+------------------------------------------------------------
+Install Nginx
+
+yum -y install httpd-tools
+htpasswd -c /usr/local/nginx/conf/.kibana-user kibanaadmin
+
+Edit the Nginx configuration file and remove the 'server { }' block, so we can add a new virtual host configuration.
+cd /usr/local/nginx/conf
+vi nginx.conf
+include   /etc/nginx/mime.types;
+default_type application/octet-stream
+
+vi kibana.conf
+server {
+    listen 80;
+
+    server_name elk.test.net;
+
+    access_log  /data/nginx/logs/elk.test.net.log upstream;
+    error_log   /data/nginx/logs/elk.test.net.error;
+
+    auth_basic "Restricted Access";
+    auth_basic_user_file /usr/local/nginx/conf/.kibana-user;
+
+    location / {
+        proxy_pass http://localhost:5601;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;        
+    }
+}
+
+
+/usr/local/nginx/sbin/nginx &
+
+http://elk_server_public_ip/
+kibanaadmin/pass
+
+
+
+------------------------------------------------------------
+------------------------------------------------------------
+
+Testing
+
+http://elk.test.net
+
+Create a new default index 'syslog-*' and click on the 'Create' button.
+Th default index has been created. If you have multiple beats on the elastic stack, you can configure the default beat with just one click on the 'star' button.
+Go to the 'Discover' menu and you will see all the log file from the client servers.
+
+
+注意:
+如果是按日期索引的日志，那么最好定期清除旧索引：
+curl -XDELETE -u <USER>:<PASSWORD>
+       http://<HOST>:9200/syslog-$(date -d '-10days' +'%Y.%m.%d')
+
+curl -XDELETE localhost:9200/syslog*
+
+curl -X DELETE 'http://localhost:9200/_all'
+curl -XGET localhost:9200/*?pretty
+
+
+------------------------------------------------------------
+------------------------------------------------------------
+Monitoring
+
+
+Kafka process   Is the right binary daemon process running?     When a process list contains the regexp /usr/bin/java*kafka.Kafka*$.
+https://github.com/HariSekhon/nagios-plugins/blob/master/check_kafka.pl
+https://github.com/quantifind/KafkaOffsetMonitor
+
+
+bin/kafka-consumer-groups.sh --list --bootstrap-server hdfs-2:9092
+bin/kafka-consumer-groups.sh --group logstash --describe --bootstrap-server hdfs-1:9092

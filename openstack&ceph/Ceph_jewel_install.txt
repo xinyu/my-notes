@@ -1,0 +1,796 @@
+
+目录
+
+概述
+环境说明
+预安装
+Ceph安装
+对象存储测试
+块存储测试
+文件存储测试
+Ceph维护
+其它
+
+----------------------------------------------------------
+----------------------------------------------------------
+概述
+----------------------------------------------------------
+----------------------------------------------------------
+
+Ceph，开源的分布式存储系统，支持对象存储，块存储，文件存储。实现了存储的弹性扩容，高可用，没有单点故障。Ceph存储的高可用通过多备份（支持备份数目指定）／erasure coding（纠删码，相比多备份节约存储空间）方式实现。
+
+部署Ceph存储集群要求至少有一个Ceph Monitor节点和两个Ceph OSD节点，如果需要使用文件存储，还需要部署一个Ceph MDS节点。
+
+Ceph OSD: 
+    存储数据，数据备份(默认支持三备份)，数据恢复，并提供监控信息给Ceph monitor等。
+    一台服务器的一个数据盘对应一个OSD进程。
+Ceph monitor: 
+    维护Ceph集群状态的maps，包括monitor map，OSD map， Placement Group (PG) map，CRUSH map。并维护这些状态变化的历史。
+    Ceph存储客户端的读写操作，都需要经过monitor获取OSD等相关信息，对于生产环境，monitor要求至少部署3节点。Ceph通过Paxos算法维护monitor之间集群状态的一致性，因此推荐monitor部署奇数个节点。
+Ceph MDS:
+    Ceph Metadata Server (MDS), 存储Ceph文件存储的metadata。块存储和对象存储不需要部署。
+
+CRUSH algorithm:
+    Controlled Replication Under Scalable Hashing (CRUSH) algorithm。
+    传统的文件系统采用集中的元数据和索引表的方式读写用户数据，Ceph客户端从monitor获取集群状态的map信息，通过CRUSH算法计算对象的元数据，直接和OSD通信读写数据。
+Placement Group (PG):
+    对象存储的逻辑单元，跨多个OSD复制数据提供高可用。一个Pool包含多个PG。
+
+客户端的数据写入Ceph存储集群，需要先指定存储的Pool，通过CRUSH算法，计算数据将存储在Pool的哪些Placement Group (PG)，哪些OSD存储了对应的Placement Group，并最终以对象的形式将数据存储到OSD所在的磁盘。CRUSH算法自动实现Ceph存储集群的弹性，rebalance，动态恢复。
+
+详细的Ceph架构原理请参考。
+http://docs.ceph.com/docs/master/architecture/
+
+----------------------------------------------------------
+----------------------------------------------------------
+环境说明
+----------------------------------------------------------
+----------------------------------------------------------
+
+部署三个Ceph节点Ceph01，Ceph02，Ceph03，每个Ceph节点部署一个monitor进程和两个OSD进程。单独部署一个ceph-admin节点管理总体的部署信息。
+
+ceph-admin
+  cpu: 1core
+  mem: 1G
+  eth0: 192.168.1.80
+
+ceph01
+  cpu: 4core
+  mem: 4G
+  eth0: 192.168.1.81
+  eth1: 10.10.10.81
+  100 GB (/dev/vdb)    ssd
+  100 GB (/dev/vdc)
+  100 GB (/dev/vdd)
+
+ceph02
+  cpu: 4core
+  mem: 4G
+  eth0: 192.168.1.82
+  eth1: 10.10.10.82
+  100 GB (/dev/vdb)    ssd
+  100 GB (/dev/vdc)
+  100 GB (/dev/vdd)
+
+ceph03
+  cpu: 4core
+  mem: 4G
+  eth0: 192.168.1.83
+  eth1: 10.10.10.83
+  100 GB (/dev/vdb)    ssd
+  100 GB (/dev/vdc)
+  100 GB (/dev/vdd)
+
+OS: CentOS 7.2
+Ceph: Jewel
+
+----------------------------------------------------------
+----------------------------------------------------------
+预安装  -- 所有节点
+----------------------------------------------------------
+----------------------------------------------------------
+
+# 管理网络IP地址设置
+vi /etc/sysconfig/network-scripts/ifcfg-eth0
+DEVICE=eth0
+ONBOOT=yes
+BOOTPROTO=static
+IPADDR=192.168.1.8X
+NETMASK=255.255.255.0
+GATEWAY=192.168.1.1
+
+# 存储网络IP地址设置(ceph-admin不需要设置)
+vi /etc/sysconfig/network-scripts/ifcfg-eth1
+DEVICE=eth1
+ONBOOT=yes
+BOOTPROTO=static
+IPADDR=10.10.10.8X
+NETMASK=255.255.255.0
+
+systemctl disable NetworkManager
+systemctl stop NetworkManager
+chkconfig network on
+systemctl restart network
+
+echo "nameserver 114.114.114.114" > /etc/resolv.conf
+
+cat >> /etc/hosts << OFF
+192.168.1.80 ceph-admin
+192.168.1.81 ceph01
+192.168.1.82 ceph02
+192.168.1.83 ceph03
+OFF
+
+ceph-admin:
+echo "ceph-admin" > /etc/hostname
+Other nodes:
+echo "cephXX" > /etc/hostname
+
+yum clean all
+yum -y update
+
+centos7.3  
+vi /etc/sysconfig/kernel   
+  # MAKEDEBUG=yes
+awk -F\' '$1=="menuentry " {print i++ " : " $2}' /etc/grub2.cfg
+grub2-mkconfig -o /boot/grub2/grub.cfg
+
+systemctl stop chronyd.service
+systemctl disable chronyd.service
+yum erase -y chrony
+rm -f /etc/chrony*
+
+yum install net-tools sysstat tcpdump wget ntp ntpdate -y
+
+sed -i -e 's/=enforcing/=disabled/g' /etc/sysconfig/selinux
+sed -i -e 's/=enforcing/=disabled/g' /etc/selinux/config
+
+systemctl stop firewalld
+systemctl disable firewalld
+
+systemctl stop postfix.service
+systemctl disable postfix.service
+
+timedatectl set-timezone Asia/Shanghai
+
+systemctl enable ntpd
+systemctl start ntpd
+ntpq -p  # Verify operation
+
+reboot
+
+----------------------------------------------------------
+----------------------------------------------------------
+Ceph安装
+----------------------------------------------------------
+----------------------------------------------------------
+1. 磁盘初始化
+
+1.1 每个OSD节点的日志磁盘建立两个日志分区
+[root@ceph01 ~]$ parted /dev/vda mklabel gpt 
+[root@ceph01 ~]$ parted /dev/vda mkpart journal01 10% 40% 
+[root@ceph01 ~]$ parted /dev/vda mkpart journal02 60% 90%
+
+[root@ceph02 ~]$ parted /dev/vda mklabel gpt 
+[root@ceph02 ~]$ parted /dev/vda mkpart journal01 10% 40% 
+[root@ceph02 ~]$ parted /dev/vda mkpart journal02 60% 90%
+
+[root@ceph03 ~]$ parted /dev/vda mklabel gpt 
+[root@ceph03 ~]$ parted /dev/vda mkpart journal01 10% 40% 
+[root@ceph03 ~]$ parted /dev/vda mkpart journal02 60% 90%
+
+1.2 每个OSD节点的数据磁盘进行格式化和挂载
+[root@ceph01 ~]# mkfs.xfs -f -i size=512 -l size=128m,lazy-count=1 -L ceph01d01 /dev/vdb 
+[root@ceph01 ~]# mkfs.xfs -f -i size=512 -l size=128m,lazy-count=1 -L ceph01d02 /dev/vdc 
+[root@ceph01 ~]# mkdir -p /data/disk1/
+[root@ceph01 ~]# mkdir -p /data/disk2/
+
+[root@ceph01 ~]# chmod +x /etc/rc.local
+[root@ceph01 ~]# vi /etc/rc.local
+...
+mount -t xfs -o noatime,nodiratime,nobarrier /dev/disk/by-label/ceph01d01 /data/disk1 
+mount -t xfs -o noatime,nodiratime,nobarrier /dev/disk/by-label/ceph01d02 /data/disk2
+...
+
+
+[root@ceph02 ~]# mkfs.xfs -f -i size=512 -l size=128m,lazy-count=1 -L ceph02d01 /dev/vdb 
+[root@ceph02 ~]# mkfs.xfs -f -i size=512 -l size=128m,lazy-count=1 -L ceph02d02 /dev/vdc 
+[root@ceph02 ~]# mkdir -p /data/disk1/
+[root@ceph02 ~]# mkdir -p /data/disk2/
+
+[root@ceph02 ~]# chmod +x /etc/rc.local
+[root@ceph02 ~]# vi /etc/rc.local
+...
+mount -t xfs -o noatime,nodiratime,nobarrier /dev/disk/by-label/ceph02d01 /data/disk1 
+mount -t xfs -o noatime,nodiratime,nobarrier /dev/disk/by-label/ceph02d02 /data/disk2
+...
+
+
+[root@ceph03 ~]# mkfs.xfs -f -i size=512 -l size=128m,lazy-count=1 -L ceph03d01 /dev/vdb 
+[root@ceph03 ~]# mkfs.xfs -f -i size=512 -l size=128m,lazy-count=1 -L ceph03d02 /dev/vdc 
+[root@ceph03 ~]# mkdir -p /data/disk1/
+[root@ceph03 ~]# mkdir -p /data/disk2/
+
+[root@ceph03 ~]# chmod +x /etc/rc.local
+[root@ceph03 ~]# vi /etc/rc.local
+...
+mount -t xfs -o noatime,nodiratime,nobarrier /dev/disk/by-label/ceph03d01 /data/disk1 
+mount -t xfs -o noatime,nodiratime,nobarrier /dev/disk/by-label/ceph03d02 /data/disk2
+...
+
+
+2. 添加用户和安装包部署(所有节点)
+
+useradd -d /home/ceph -m ceph
+echo -e "ceph\nceph\n" | passwd ceph
+echo "ceph ALL = (root) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/ceph
+chmod 0440 /etc/sudoers.d/ceph
+echo -e 'Defaults:ceph !requiretty\nceph ALL = (root) NOPASSWD:ALL' | tee /etc/sudoers.d/ceph
+chmod 440 /etc/sudoers.d/ceph
+
+
+yum -y install epel-release
+yum -y install centos-release-ceph-jewel  
+yum -y install yum-plugin-priorities
+sed -i -e "s/enabled=1/enabled=1\npriority=1/g" /etc/yum.repos.d/CentOS-Ceph-Jewel.repo
+
+yum -y install ceph ceph-radosgw
+
+
+3. 通过ceph-admin节点部署配置ceph到各OSD节点
+
+3.1 用户免密码登录设置
+[ceph@ceph-admin ~]$ssh-keygen -t rsa
+[ceph@ceph-admin ~]$vi ~/.ssh/config
+
+Host ceph-admin
+    Hostname ceph-admin
+    User ceph
+Host ceph01
+    Hostname ceph01
+    User ceph
+Host ceph02
+    Hostname ceph02
+    User ceph
+Host ceph03
+    Hostname ceph03
+    User ceph
+
+[ceph@ceph-admin ~]$chmod 600 ~/.ssh/config
+
+[ceph@ceph-admin ~]$ssh-copy-id ceph01
+[ceph@ceph-admin ~]$ssh-copy-id ceph02
+[ceph@ceph-admin ~]$ssh-copy-id ceph03
+
+
+3.2 ceph-admin节点安装ceph自动部署包
+[ceph@ceph-admin ~]$sudo yum -y install ceph-deploy
+
+3.3 创建ceph集群
+[ceph@ceph-admin ~]$mkdir ceph-cluster
+[ceph@ceph-admin ~]$cd ceph-cluster
+[ceph@ceph-admin ceph-cluster]$sudo ceph-deploy new ceph01 ceph02 ceph03
+[ceph@ceph-admin ceph-cluster]$sudo chown -R ceph:ceph /home/ceph/ceph-cluster/
+[ceph@ceph-admin ceph-cluster]$vi ./ceph.conf
+
+cat << EOF >> ceph.conf
+
+osd_pool_default_size = 2
+osd_pool_default_min_size = 2 
+osd_pool_default_pg_num = 128 
+osd_pool_default_pgp_num = 128
+
+osd_max_backfills = 1 
+osd_recovery_max_active = 1 
+osd crush update on start = 0
+
+debug_ms = 0 
+debug_osd = 0
+
+osd_recovery_max_single_start = 1 
+filestore_max_sync_interval = 15 
+filestore_min_sync_interval = 10 
+filestore_queue_max_ops = 65536
+filestore_queue_max_bytes = 536870912 
+filestore_queue_committing_max_bytes = 536870912 
+filestore_queue_committing_max_ops = 65536
+
+filestore_wbthrottle_xfs_bytes_start_flusher = 419430400 filestore_wbthrottle_xfs_bytes_hard_limit = 4194304000 filestore_wbthrottle_xfs_ios_start_flusher = 5000 
+filestore_wbthrottle_xfs_ios_hard_limit = 50000 filestore_wbthrottle_xfs_inodes_start_flusher = 5000 filestore_wbthrottle_xfs_inodes_hard_limit = 50000
+
+journal_max_write_bytes = 1073714824 
+journal_max_write_entries = 5000 
+journal_queue_max_ops = 65536 
+journal_queue_max_bytes = 536870912
+
+osd_client_message_cap = 65536 
+osd_client_message_size_cap = 524288000 
+ms_dispatch_throttle_bytes = 536870912
+
+filestore_fd_cache_size = 4096
+
+osd_op_threads = 10 
+osd_disk_threads = 2 
+filestore_op_threads = 6
+
+osd_client_op_priority = 100 
+osd_recovery_op_priority = 5
+
+[osd]
+cluster_network = 10.10.10.0/24
+public_network = 192.168.1.0/24
+
+EOF
+
+
+[ceph@ceph-admin ceph-cluster]$ ceph-deploy install ceph-admin ceph01 ceph02 ceph03
+[ceph@ceph-admin ceph-cluster]$ ceph-deploy --overwrite-conf mon create-initial 
+
+[ceph@ceph-admin ceph-cluster]$ ceph-deploy disk list ceph01
+
+[ceph@ceph-admin ceph-cluster]$ ceph-deploy --overwrite-conf osd create \
+ceph01:/data/disk1:/dev/disk/by-partlabel/journal01 \
+ceph01:/data/disk2:/dev/disk/by-partlabel/journal02 \
+ceph02:/data/disk1:/dev/disk/by-partlabel/journal01 \
+ceph02:/data/disk2:/dev/disk/by-partlabel/journal02 \
+ceph03:/data/disk1:/dev/disk/by-partlabel/journal01 \
+ceph03:/data/disk2:/dev/disk/by-partlabel/journal02
+
+[ceph@ceph-admin ceph-cluster]$ ceph-deploy --overwrite-conf osd activate \
+ceph01:/data/disk1:/dev/disk/by-partlabel/journal01 \
+ceph01:/data/disk2:/dev/disk/by-partlabel/journal02 \
+ceph02:/data/disk1:/dev/disk/by-partlabel/journal01 \
+ceph02:/data/disk2:/dev/disk/by-partlabel/journal02 \
+ceph03:/data/disk1:/dev/disk/by-partlabel/journal01 \
+ceph03:/data/disk2:/dev/disk/by-partlabel/journal02
+
+[ceph@ceph-admin ceph-cluster]$ ceph-deploy admin ceph-admin ceph01 ceph02 ceph03
+[ceph@ceph-admin ceph-cluster]$ sudo chmod 644 /etc/ceph/ceph.client.admin.keyring
+[ceph@ceph-admin ceph-cluster]$ ceph-deploy --overwrite-conf config push ceph01 ceph02 ceph03
+[ceph@ceph-admin ceph-cluster]$ ceph-deploy gatherkeys ceph01 ceph02 ceph03
+
+[ceph@ceph01 ~]$ sudo chmod 644 /etc/ceph/ceph.client.admin.keyring
+[ceph@ceph02 ~]$ sudo chmod 644 /etc/ceph/ceph.client.admin.keyring
+[ceph@ceph03 ~]$ sudo chmod 644 /etc/ceph/ceph.client.admin.keyring
+
+
+# ceph集群创建完成检查集群状态，OSD权值等未设置，目前的集群状态: HEALTH_WARN
+[ceph@ceph-admin ceph-cluster]$ ceph -s
+    cluster 305b1310-d8e3-4ac3-bb2d-2f76bd424d24
+     health HEALTH_WARN
+            64 pgs stuck inactive
+            64 pgs stuck unclean
+            too few PGs per OSD (10 < min 30)
+     monmap e1: 3 mons at {ceph01=192.168.1.81:6789/0,ceph02=192.168.1.82:6789/0,ceph03=192.168.1.83:6789/0}
+            election epoch 8, quorum 0,1,2 ceph01,ceph02,ceph03
+     osdmap e13: 6 osds: 6 up, 6 in
+      pgmap v26: 64 pgs, 1 pools, 0 bytes data, 0 objects
+            194 MB used, 557 GB / 558 GB avail
+                  64 creating
+
+# 查看每个OSD节点的OSD ID
+[ceph@ceph01 ~]$ cat /data/disk1/whoami
+0
+[ceph@ceph01 ~]$ cat /data/disk2/whoami
+1
+[ceph@ceph02 ~]$ cat /data/disk1/whoami
+2
+[ceph@ceph02 ~]$ cat /data/disk2/whoami
+3
+[ceph@ceph03 ~]$ cat /data/disk1/whoami
+4
+[ceph@ceph03 ~]$ cat /data/disk2/whoami
+5
+
+# 根据OSD ID号, 建立CRUSH结构树
+[ceph@ceph-admin ceph-cluster]$
+ceph osd crush add-bucket ceph01 host
+ceph osd crush add-bucket ceph02 host
+ceph osd crush add-bucket ceph03 host
+ceph osd crush move ceph01 root=default
+ceph osd crush move ceph02 root=default
+ceph osd crush move ceph03 root=default
+
+ceph osd crush create-or-move osd.0 0.2 root=default host=ceph01
+ceph osd crush create-or-move osd.1 0.2 root=default host=ceph01
+ceph osd crush create-or-move osd.2 0.2 root=default host=ceph02 
+ceph osd crush create-or-move osd.3 0.2 root=default host=ceph02
+ceph osd crush create-or-move osd.4 0.2 root=default host=ceph03 
+ceph osd crush create-or-move osd.5 0.2 root=default host=ceph03
+
+# 创建后的CRUSH结构树
+[ceph@ceph-admin ceph-cluster]$ ceph osd tree
+ID WEIGHT  TYPE NAME       UP/DOWN REWEIGHT PRIMARY-AFFINITY 
+-1 1.19998 root default                                      
+-2 0.39999     host ceph01                                   
+ 0 0.20000         osd.0        up  1.00000          1.00000 
+ 1 0.20000         osd.1        up  1.00000          1.00000 
+-3 0.39999     host ceph02                                   
+ 2 0.20000         osd.2        up  1.00000          1.00000 
+ 3 0.20000         osd.3        up  1.00000          1.00000 
+-4 0.39999     host ceph03                                   
+ 4 0.20000         osd.4        up  1.00000          1.00000 
+ 5 0.20000         osd.5        up  1.00000          1.00000 
+
+# 集群状态: HEALTH_OK
+[ceph@ceph-admin ceph-cluster]$ ceph -s
+    cluster 305b1310-d8e3-4ac3-bb2d-2f76bd424d24
+     health HEALTH_OK
+     monmap e1: 3 mons at {ceph01=192.168.1.81:6789/0,ceph02=192.168.1.82:6789/0,ceph03=192.168.1.83:6789/0}
+            election epoch 8, quorum 0,1,2 ceph01,ceph02,ceph03
+     osdmap e27: 6 osds: 6 up, 6 in
+      pgmap v48: 64 pgs, 1 pools, 0 bytes data, 0 objects
+            198 MB used, 557 GB / 558 GB avail
+                  64 active+clean
+
+
+----------------------------------------------------------
+----------------------------------------------------------
+对象存储测试
+----------------------------------------------------------
+----------------------------------------------------------
+
+# 登录安装了ceph客户端的机器，创建一个Pool
+ceph osd pool create test 64 64
+
+# 查询Pool
+rados lspools
+ceph osd dump
+
+# 指定Pool上传一个对象
+rados -p test put object1 /etc/hosts
+
+# 查询对象
+rados -p test ls
+
+# 创建对象的一个快照
+rados mksnap snapshot01 -p test
+
+# 查询快照
+rados lssnap -p test
+
+# 删除对象
+rados -p test rm object1
+rados -p test ls
+
+# 通过快照恢复对象
+rados -p test listsnaps object1
+rados rollback -p test object1 snapshot01
+rados -p test ls
+
+# 删除Pool
+ceph osd pool delete test
+
+# 说明
+对象存储一般是通过http REST接口访问，需要部署RADOS Gateway相关组件和配置。Ceph的对象存储网关支持S3和shift兼容的RESTfull API接口访问。同时支持C++/java/python等多种语言的绑定。
+
+----------------------------------------------------------
+----------------------------------------------------------
+块存储测试
+----------------------------------------------------------
+----------------------------------------------------------
+
+# 登录安装了ceph客户端的机器，创建一个1G的块存储，MB
+rbd create vm-data-01 --size 1024 -p rbd
+
+# 查询块存储信息
+rbd ls
+rbd --image vm-data-01 info
+
+# 在其它虚拟机挂载创建的块存储，其它虚拟机相当于Ceph的客户端，需要部署Ceph的客户端管理相关组件
+modprobe rbd   # if show 'rbd not found', linux kernel need update to centos    7.2
+ceph-deploy install ceph-client1
+ceph-deploy admin ceph-client1
+
+# 块存储map到Ceph客户端节点
+rbd map --image vm-data-01
+
+# 查询map的块存储
+rbd showmapped
+lsblk
+
+# 格式化和挂载到文件系统
+fdisk -l /dev/rbd0
+mkfs.xfs /dev/rbd0
+mkdir /mnt/ceph-vol1
+mount /dev/rbd0 /mnt/ceph-vol1
+
+# 磁盘读写测试
+dd if=/dev/zero of=/mnt/ceph-vol1/file1 count=100 bs=1M oflag=direct
+
+# 动态扩充块存储大小到2G
+rbd resize rbd/vm-data-01 --size 2048
+rbd --image vm-data-01 info
+xfs_growfs -d /mnt/ceph-vol1
+
+# 建立块存储快照
+rbd snap create rbd/vm-data-01@snap1
+rbd snap ls rbd/vm-data-01
+
+# 通过快照恢复文件系统
+rbd snap rollback rbd/vm-data-01@snap1
+umount /mnt/ceph-vol1
+mount /dev/rbd0 /mnt/ceph-vol1
+
+# 删除快照
+rbd snap rm rbd/vm-data-01@snap1
+rbd snap purge rbd/vm-data-01 # delete all snapshots
+
+# 释放块存储
+umount /mnt/ceph-vol1
+rbd  unmap /dev/rbd0
+
+
+----------------------------------------------------------
+----------------------------------------------------------
+文件存储测试
+----------------------------------------------------------
+----------------------------------------------------------
+
+# 为了支持文件存储，需要部署至少一个MDS进程
+
+# 部署MDS
+ssh ceph@ceph-admin
+cd /home/ceph/ceph-cluster
+ceph-deploy --overwrite-conf mds create ceph01
+
+# 查看集群中的mds状态
+ceph -s
+ceph mds stat
+
+# 创建data pool和metadata pool
+ceph osd pool create cephfs_data 64 64
+ceph osd pool create cephfs_metadata 64 64
+
+# 创建ceph文件系统
+ceph fs new cephfs cephfs_metadata cephfs_data
+
+# 验证状态
+ceph mds stat
+ceph fs ls
+
+# 通过内核驱动挂载ceph文件系统
+mkdir /mnt/kernel_cephfs
+
+cat /etc/ceph/ceph.client.admin.keyring
+
+echo AQDBgwhYSiHZIxAA2MVVtSTOvR+QD3BzaIcLuw== > /etc/ceph/adminkey
+
+mount -t ceph 192.168.1.81:6789:/ /mnt/kernel_cephfs -o name=admin,secretfile=/etc/ceph/adminkey
+
+vim /etc/fstab
+192.168.1.81:6789:/  /mnt/kernel_ceph  ceph name=admin,secretfile=/etc/ceph/adminkey,noatime  0  2
+
+
+----------------------------------------------------------
+----------------------------------------------------------
+Ceph维护
+----------------------------------------------------------
+----------------------------------------------------------
+
+1. 删除 OSD
+# 移除故障的数据盘 OSD.5
+[ceph@ceph-admin ceph-cluster]$ ceph osd out 5
+[ceph@ceph03 ~]# sudo service ceph stop osd.5
+[ceph@ceph-admin ceph-cluster]$ ceph osd crush remove osd.5
+[ceph@ceph-admin ceph-cluster]$ ceph auth del osd.5
+[ceph@ceph-admin ceph-cluster]$ ceph osd rm 5
+[ceph@ceph-admin ceph-cluster]$ ceph-deploy --overwrite-conf config push ceph01 ceph02 ceph03
+
+2. 增加 OSD
+# 增加 ceph03 节点的/data/disk2/(必须为空目录)
+[ceph@ceph-admin ceph-cluster]$ ceph-deploy --overwrite-conf osd create \
+ceph03:/data/disk2:/dev/disk/by-partlabel/journal02
+[ceph@ceph-admin ceph-cluster]$ ceph-deploy --overwrite-conf osd activate \
+ceph03:/data/disk2:/dev/disk/by-partlabel/journal02
+[ceph@ceph-admin ceph-cluster]$ ceph-deploy --overwrite-conf config push ceph01 ceph02 ceph03
+
+
+3. 删除 MON
+[ceph@ceph03 ~]$ sudo service ceph stop mon.ceph03
+[ceph@ceph03 ~]$ sudo ceph mon remove ceph03
+[ceph@ceph-admin ceph-cluster]$ vim ceph.conf
+...
+mon_initial_members = ceph01, ceph02
+mon_host = 192.168.1.81,192.168.1.82
+...
+[ceph@ceph-admin ceph-cluster]$ ceph-deploy --overwrite-conf config push ceph01 ceph02 ceph03
+
+4. 增加 MON
+[ceph@ceph-admin ceph-cluster]$ ceph mon dump
+[ceph@ceph03 ~]$ ceph mon add ceph03 192.168.1.83:6789
+[ceph@ceph-admin ceph-cluster]$ ceph-deploy --overwrite-conf mon create ceph03
+[ceph@ceph-admin ceph-cluster]$ vim ceph.conf
+...
+mon_initial_members = ceph01, ceph02, ceph03
+mon_host = 192.168.1.81,192.168.1.82,192.168.1.83
+...
+[ceph@ceph-admin ceph-cluster]$ ceph-deploy --overwrite-conf config push ceph01 ceph02 ceph03
+
+5. Adjust the replication level
+$ ceph osd dump | grep ^pool
+$ ceph osd pool set nova size 3
+
+----------------------------------------------------------
+----------------------------------------------------------
+Ceph和Openstack glance整合 (openstack高可用环境)
+----------------------------------------------------------
+----------------------------------------------------------
+controllerX:
+useradd -d /home/ceph -m ceph
+echo -e "ceph\nceph\n" | passwd ceph
+echo "ceph ALL = (root) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/ceph
+chmod 0440 /etc/sudoers.d/ceph
+echo -e 'Defaults:ceph !requiretty\nceph ALL = (root) NOPASSWD:ALL' | tee /etc/sudoers.d/ceph
+chmod 440 /etc/sudoers.d/ceph
+
+yum -y install centos-release-ceph-hammer  
+yum -y install yum-plugin-priorities
+sed -i -e "s/enabled=1/enabled=1\npriority=1/g" /etc/yum.repos.d/CentOS-Ceph-Hammer.repo
+yum -y install ceph ceph-radosgw
+
+ceph-admin:
+ssh-copy-id ceph@controllerX
+cd ceph-cluster
+ceph-deploy install controllerX
+ceph-deploy config push controllerX
+
+
+ceph-admin:
+Create Ceph pools for glance
+ceph osd pool create images 128
+ceph osd lspools
+
+Set up client authentication by creating a new user for glance
+ceph auth get-or-create client.glance mon 'allow r' osd 'allow class-read object_prefix rbd_children, allow rwx pool=images'
+
+Add the keyrings to controller1 and change their ownership
+ceph auth get-or-create client.glance | ssh controllerX sudo tee /etc/ceph/ceph.client.glance.keyring
+ssh controllerX sudo chown glance:glance /etc/ceph/ceph.client.glance.keyring
+
+
+controllerX:
+test:
+cd /etc/ceph
+ceph -s --name client.glance --keyring ceph.client.glance.keyring
+
+controllerX:
+Configuring Glance for Ceph backend
+glance node:
+vi /etc/glance/glance-api.conf
+  [DEFAULT]
+  show_image_direct_url=True
+
+  [glance_store]
+  default_store=rbd
+  stores = rbd
+  rbd_store_ceph_conf=/etc/ceph/ceph.conf
+  rbd_store_user=glance
+  rbd_store_pool=images
+  rbd_store_chunk_size=8
+
+  [paste_deploy]
+  flavor = keystone
+
+systemctl restart openstack-glance-api
+
+controller1:
+glance image-create --name cirros_ceph --disk-format qcow2 --container-format bare --file cirros-0.3.4-x86_64-disk.img --visibility public
+glance image-list
+rados -p images ls --name client.glance --keyring /etc/ceph/ceph.client.glance.keyring | grep -i id
+
+
+----------------------------------------------------------
+----------------------------------------------------------
+Ceph和Openstack cinder,nova整合 (openstack高可用环境)
+----------------------------------------------------------
+----------------------------------------------------------
+
+Create Ceph pools for cinder, nova
+ceph osd pool create volumes 128
+ceph osd pool create vms 128
+ceph osd lspools
+
+Set up client authentication by creating a new user for cinder:
+ceph auth get-or-create client.cinder mon 'allow r' osd 'allow class-read object_prefix rbd_children, allow rwx pool=volumes, allow rwx pool=vms, allow rx pool=images'
+
+Add the keyrings to os-node1 and change their ownership:
+ceph auth get-or-create client.cinder | ssh controllerX sudo tee /etc/ceph/ceph.client.cinder.keyring
+ssh controllerX sudo chown cinder:cinder /etc/ceph/ceph.client.cinder.keyring
+
+The libvirt process requires accessing the Ceph cluster while attaching or detaching a block device from Cinder. 
+ceph auth get-key client.cinder | ssh controllerX tee /etc/ceph/temp.client.cinder.key
+
+test:
+cd /etc/ceph
+ceph -s --name client.cinder --keyring ceph.client.cinder.keyring
+
+Finally, generate uuid, then create, define, and set the secret key to libvirt and remove temporary keys:
+cd /etc/ceph
+uuidgen
+cat > secret.xml <<EOF
+<secret ephemeral='no' private='no'>
+    <uuid>5c883a61-032d-4d76-ab8b-119efc7b768a</uuid>
+    <usage type='ceph'>
+        <name>client.cinder secret</name>
+    </usage>
+</secret>
+EOF
+virsh secret-define --file secret.xml
+virsh secret-set-value --secret 5c883a61-032d-4d76-ab8b-119efc7b768a --base64 $(cat temp.client.cinder.key) && rm temp.client.cinder.key secret.xml
+virsh secret-list
+
+
+Configuring Cinder for Ceph backend
+vi /etc/cinder/cinder.conf
+[DEFAULT]
+...
+enabled_backends = ceph
+...
+[ceph]
+volume_driver = cinder.volume.drivers.rbd.RBDDriver
+
+rados_connect_timeout = -1
+rados_connection_interval = 5
+rados_connection_retries = 3
+rdb_ceph_conf = /etc/ceph/ceph.conf
+rbd_cluster_name = ceph
+
+rbd_flatten_volume_from_snapshot = True
+rbd_max_clone_depth = 5
+rbd_pool = volumes
+rbd_user = cinder
+rbd_secret_uuid= 5c883a61-032d-4d76-ab8b-119efc7b768a
+rbd_store_chunk_size = 4
+
+systemctl restart openstack-cinder-volume
+
+cinder list
+cinder create --display-name ceph-volume01 --display-description "Cinder volume on CEPH storage" 2
+rados -p volumes --name client.cinder --keyring ceph.client.cinder.keyring ls | grep -i id
+
+
+Configuring Nova to attach Ceph RBD
+vi /etc/nova/nova.conf
+[nova.virt.libvirt.volume]
+rbd_user=cinder
+rbd_secret_uuid= 5c883a61-032d-4d76-ab8b-119efc7b768a
+
+systemctl restart openstack-nova-compute
+
+nova list
+cinder list
+nova volume-attach 1cadffc0-58b0-43fd-acc4-33764a02a0a6 1337c866-6ff7-4a56-bfe5-b0b80abcb281
+
+
+
+Configuring Nova to boot instances from Ceph RBD
+vi /etc/nova/nova.conf
+[libvirt]
+...
+images_type = rbd
+images_rbd_pool = vms
+images_rbd_ceph_conf = /etc/ceph/ceph.conf
+rbd_user = cinder
+rbd_secret_uuid= 5c883a61-032d-4d76-ab8b-119efc7b768a
+disk_cachemodes = "network=writeback"
+inject_password = false
+inject_key = false
+inject_partition = -2
+live_migration_flag="VIR_MIGRATE_UNDEFINE_SOURCE,VIR_MIGRATE_PEER2PEER,VIR_MIGRATE_LIVE,VIR_MIGRATE_PERSIST_DEST,VIR_MIGRATE_TUNNELLED"
+hw_disk_discard = unmap
+
+systemctl restart openstack-nova-compute
+
+To boot a vm in Ceph, the glance image format must be RAW.
+qemu-img convert -f qcow2 -O raw cirros-0.3.4-x86_64-disk.img cirros-0.3.4-x86_64-disk.raw
+glance image-create --name cirros_raw_image --visibility public --disk-format raw --container-format bare --file cirros-0.3.4-x86_64-disk.raw
+
+nova image-list
+cinder create --image-id ff8d9729-5505-4d2a-94ad-7154c6085c97 --display-name cirros-ceph-boot-volume 1
+cinder list
+
+
+参考资料
+http://docs.ceph.com/docs/master/
+http://docs.ceph.com/docs/jewel/rbd/rbd-openstack/

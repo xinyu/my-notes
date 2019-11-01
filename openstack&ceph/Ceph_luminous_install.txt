@@ -1,0 +1,358 @@
+
+----------------------------------------------------------
+----------------------------------------------------------
+环境说明
+----------------------------------------------------------
+----------------------------------------------------------
+
+部署三个Ceph节点Ceph01，Ceph02，Ceph03，每个Ceph节点部署一个monitor进程和两个OSD进程。单独部署一个ceph-admin节点管理总体的部署信息。
+
+ceph-admin
+  cpu: 1core
+  mem: 1G
+  eth0: 192.168.1.80
+
+dev92
+  cpu: 4core
+  mem: 8G
+  eth0: 192.168.1.92
+  eth1: 10.0.91.92
+  100 GB (/dev/vdb)    ssd
+  100 GB (/dev/vdc)
+  100 GB (/dev/vdd)
+
+dev93
+  cpu: 4core
+  mem: 8G
+  eth0: 192.168.1.93
+  eth1: 10.0.91.93
+  100 GB (/dev/vdb)    ssd
+  100 GB (/dev/vdc)
+  100 GB (/dev/vdd)
+
+dev94
+  cpu: 4core
+  mem: 8G
+  eth0: 192.168.1.94
+  eth1: 10.0.91.94
+  100 GB (/dev/vdb)    ssd
+  100 GB (/dev/vdc)
+  100 GB (/dev/vdd)
+
+OS: CentOS 7.5
+Ceph: Luminous 12.5 
+
+----------------------------------------------------------
+----------------------------------------------------------
+预安装  -- 所有节点
+----------------------------------------------------------
+----------------------------------------------------------
+
+# 管理网络IP地址设置
+vi /etc/sysconfig/network-scripts/ifcfg-eth0
+DEVICE=eth0
+ONBOOT=yes
+BOOTPROTO=static
+IPADDR=192.168.1.9X
+NETMASK=255.255.255.0
+GATEWAY=192.168.1.1
+
+# 存储网络IP地址设置(ceph-admin不需要设置)
+vi /etc/sysconfig/network-scripts/ifcfg-eth1
+DEVICE=eth1
+ONBOOT=yes
+BOOTPROTO=static
+IPADDR=10.0.91.x
+NETMASK=255.255.255.0
+
+systemctl disable NetworkManager
+systemctl stop NetworkManager
+chkconfig network on
+systemctl restart network
+
+echo "nameserver 223.5.5.5" > /etc/resolv.conf
+
+cat >> /etc/hosts << OFF
+192.168.1.92 dev92
+192.168.1.93 dev93
+192.168.1.94 dev94
+OFF
+
+ceph-admin:
+echo "ceph-admin" > /etc/hostname
+Other nodes:
+echo "dev9x" > /etc/hostname
+
+yum clean all
+yum -y update
+
+centos7.3  
+vi /etc/sysconfig/kernel   
+  # MAKEDEBUG=yes
+awk -F\' '$1=="menuentry " {print i++ " : " $2}' /etc/grub2.cfg
+grub2-mkconfig -o /boot/grub2/grub.cfg
+
+systemctl stop chronyd.service
+systemctl disable chronyd.service
+yum erase -y chrony
+rm -f /etc/chrony*
+
+yum install net-tools sysstat tcpdump wget ntp ntpdate -y
+
+sed -i -e 's/=enforcing/=disabled/g' /etc/sysconfig/selinux
+sed -i -e 's/=enforcing/=disabled/g' /etc/selinux/config
+
+systemctl stop firewalld
+systemctl disable firewalld
+
+systemctl stop postfix.service
+systemctl disable postfix.service
+
+timedatectl set-timezone Asia/Shanghai
+
+systemctl enable ntpd
+systemctl start ntpd
+ntpq -p  # Verify operation
+
+reboot
+
+----------------------------------------------------------
+----------------------------------------------------------
+Ceph安装
+----------------------------------------------------------
+----------------------------------------------------------
+
+ssh-keygen
+ssh-copy-id root@192.168.1.92
+ssh-copy-id root@192.168.1.93
+ssh-copy-id root@192.168.1.94
+
+2. 创建集群
+2.0 Clean
+# remove packages
+ceph-deploy purge dev92 dev93 dev94
+# remove settings
+ceph-deploy purgedata dev92 dev93 dev94
+ceph-deploy forgetkeys 
+
+2.1 创建集群
+yum install python2-pip
+pip install ceph-deploy
+pip install ceph-deploy==1.5.39
+
+ceph-deploy new dev92 dev93 dev94
+
+vi ceph.conf
+public_network = 192.168.1.0/24
+cluster_network = 10.0.91.0/24
+
+[mon]
+mon_allow_pool_delete = true
+
+2.2 安装 Ceph
+# ceph-deploy install dev92 dev93 dev94 --repo-url=http://mirrors.aliyun.com/ceph/rpm-luminous/el7/ --gpg-url=http://mirrors.aliyun.com/centos/RPM-GPG-KEY-CentOS-7
+
+
+yum -y install epel-release
+yum -y install centos-release-ceph-luminous  
+yum -y install yum-plugin-priorities
+sed -i -e "s/enabled=1/enabled=1\npriority=1/g" /etc/yum.repos.d/CentOS-Ceph-Luminous.repo
+yum -y install ceph
+
+ceph-deploy install dev92 dev93 dev94 --no-adjust-repos
+
+2.3 配置初始 monitor(s)、并收集所有密钥
+ceph-deploy mon create-initial
+
+# Copy the configuration file and admin key to all the nodes
+ceph-deploy admin dev92 dev93 dev94
+
+2.4 擦净磁盘
+vi /usr/lib/python2.7/site-packages/ceph_deploy/osd.py
+line: 376
+-                distro.conn.logger(line)
++                distro.conn.logger.info(line)
+
+ceph-deploy disk list dev92
+
+https://github.com/ceph/ceph-deploy/pull/464/files/58aa02d706c9bea23e08833c3947265041d3bab0
+ceph-deploy disk zap dev92 /dev/vda
+ceph-deploy disk zap dev93 /dev/vda
+ceph-deploy disk zap dev94 /dev/vda
+
+
+2.5 创建 OSD
+ceph-deploy osd create dev92 --data /dev/vda
+ceph-deploy osd create dev93 --data /dev/vda
+ceph-deploy osd create dev94 --data /dev/vda
+
+指定block.wal和block.db设备创建OSD
+http://www.yangguanjun.com/2018/04/06/ceph-deploy-latest-luminous/
+ceph-conf --show-config | grep bluestore_block
+block.db和block.wal为10G
+# Notice: –data can be a Logical Volume using the vg/lv notation. Other devices can be existing logical volumes or GPT partitions 
+ceph-deploy osd create dev92 --data /dev/vda --block-db /dev/vdb1 --block-wal /dev/vdb2
+
+2.6
+ceph-deploy admin dev92 dev93 dev94
+
+2.7
+ceph-deploy mgr create dev92
+
+ceph-deploy --overwrite-conf config push dev92 dev93 dev94
+
+2.8 Perf test
+ceph osd pool create data 128 128
+
+rados bench -p data 100 write
+Bandwidth (MB/sec):     107.391
+Average IOPS:           26
+Average Latency(s):     0.595912
+
+RBD mapped devices
+
+rados mkpool ebs
+rbd -p ebs create --size 20000 ebs
+rbd -p ebs map ebs
+mkfs.xfs /dev/rbd0
+mount /dev/rbd0 /mnt
+
+rbd -p ebs info ebs
+rbd feature disable ebs/ebs deep-flatten
+rbd feature disable ebs/ebs fast-diff
+rbd feature disable ebs/ebs object-map
+rbd feature disable ebs/ebs exclusive-lock
+
+cd /mnt
+sudo dd if=/dev/zero of=test01 bs=1G count=1 oflag=direct
+1073741824 bytes (1.1 GB) copied, 9.99843 s, 107 MB/s
+sudo dd if=/dev/zero of=test02 bs=4M count=1000 oflag=direct
+4194304000 bytes (4.2 GB) copied, 131.256 s, 32.0 MB/s
+sudo dd if=/dev/zero of=test03 bs=4k count=10240 oflag=direct
+41943040 bytes (42 MB) copied, 63.0269 s, 665 kB/s
+41943040 bytes (42 MB) copied, 197.136 s, 213 kB/s
+
+
+bluestore_cache_size  1GB  # By default this is 1 GB for HDD-backed OSDs and 3 GB for SSD-backed OSDs
+bluestore_cache_size_ssd  Default:  3 * 1024 * 1024 * 1024 (3 GB)
+bluestore_cache_size_hdd  Default:  1 * 1024 * 1024 * 1024 (1 GB)
+bluestore_cache_meta_ratio Default: .01
+bluestore_cache_kv_ratio  Default:  .99
+bluestore_cache_kv_max    Default:  512 * 1024*1024 (512 MB)
+
+bluestore_csum_type Default:    crc32c
+
+
+问题：
+1. health: HEALTH_WARN
+            application not enabled on 1 pool(s)
+   解决： ceph osd pool application enable ebs rbd
+
+2. 修改openstack安全组(新创建虚拟机)，openstack控制节点iptables需要重启，否则外网不通。
+
+3. 
+ceph mgr services
+ceph mgr module enable dashboard
+ceph mgr module ls
+ceph config set mgr mgr/dashboard/server_addr $IP
+ceph config set mgr mgr/dashboard/server_port $PORT
+ceph dashboard set-login-credentials <username> <password>
+
+4.
+rbd -p vms ls
+rbd export -p vms rbd_id.d5e53dec-1bbe-4cdc-9d42-60e5acb1aaba_disk k8s_template.raw
+qemu-img convert -f raw -O qcow2 k8s_template.raw k8s_template.qcow2
+
+yum remove cloud-init
+
+rbd -p vms ls
+rbd -p vms info 65008a08-317d-4b76-9316-9be03615173b_disk
+rbd feature disable vms/65008a08-317d-4b76-9316-9be03615173b_disk deep-flatten
+rbd feature disable vms/65008a08-317d-4b76-9316-9be03615173b_disk fast-diff
+rbd feature disable vms/65008a08-317d-4b76-9316-9be03615173b_disk object-map
+rbd feature disable vms/65008a08-317d-4b76-9316-9be03615173b_disk exclusive-lock
+rbd -p vms map 65008a08-317d-4b76-9316-9be03615173b_disk
+mkfs.xfs /dev/rbd0
+mount /dev/rbd0 /mnt
+
+http://manjusri.ucsc.edu/2017/08/30/luminous-on-pulpos/
+http://www.yangguanjun.com/2018/04/06/ceph-deploy-latest-luminous/
+http://tracker.ceph.com/projects/ceph/wiki/Tuning_for_All_Flash_Deployments   jewel
+https://software.intel.com/en-us/articles/using-intel-optane-technology-with-ceph-to-build-high-performance-oltp-solutions
+https://docs.mirantis.com/mcp/latest/index.html
+
+
+# ceph.conf
+[global]
+fsid = fdd93188-f05c-466b-a784-0377cb6a797a
+mon_initial_members = dc80, dc85, dc50
+mon_host = 192.168.5.80,192.168.5.85,192.168.5.50
+auth_cluster_required = cephx
+auth_service_required = cephx
+auth_client_required = cephx
+
+osd_pool_default_size = 2
+osd_pool_default_min_size = 1
+osd_pool_default_pg_num = 128 
+osd_pool_default_pgp_num = 128
+
+debug_ms = 0 
+debug_osd = 0
+
+max open files = 131072
+
+public_network = 192.168.5.0/24
+
+[osd]
+cluster_network = 172.16.5.0/24
+public_network = 192.168.5.0/24
+
+filestore xattr use omap = true
+filestore max sync interval = 15
+filestore min sync interval = 10
+filestore queue max ops = 25000
+filestore queue max bytes = 10485760
+filestore queue committing max ops = 5000
+filestore queue committing max bytes = 10485760000
+filestore op threads = 32
+
+osd journal size = 20000
+journal max write bytes = 1073714824
+journal max write entries = 10000
+journal queue max ops = 50000
+journal queue max bytes = 10485760000
+
+osd max write size = 512
+osd client message size cap = 2147483648
+osd deep scrub stride = 131072
+osd op threads = 8
+osd disk threads = 4
+osd map cache size = 1024
+osd map cache bl size = 128
+osd mount options xfs = "rw,noexec,nodev,noatime,nodiratime,nobarrier"
+
+osd recovery op priority = 4
+osd recovery max active = 10
+osd max backfills = 4
+
+[mon]
+mon osd down out interval = 600
+mon osd min down reporters = 3 
+mon clock drift allowed = 0.15
+mon clock drift warn backoff = 30
+mon osd full ratio = 0.95
+mon osd nearfull ratio = 0.85
+mon osd report timeout = 300
+mon pg warn max per osd = 0
+mon osd allow primary affinity = true
+mon pg warn max object skew = 10
+
+[client]
+rbd cache = true
+rbd cache writethrough until flush = true
+rbd concurrent management ops = 20
+rbd cache size = 268435456
+rbd cache max dirty = 134217728
+rbd cache max dirty age = 5
+
+

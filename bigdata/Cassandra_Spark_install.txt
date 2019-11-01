@@ -1,0 +1,322 @@
+
+Cassandra
+
+Hosts:
+cassandra-1 192.168.1.112
+cassandra-2 192.168.1.115
+cassandra-3 192.168.1.116
+
+Content:
+Prepare
+Java
+Scala
+Cassandra
+zeppelin(query)
+  https://www.vultr.com/docs/how-to-install-apache-zeppelin-on-centos-7
+ML
+  https://github.com/databricks/spark-sklearn
+Spark
+
+------------------------------------------------------------
+------------------------------------------------------------
+
+Prepare
+
+Cassandra Server : OS: CentOS 7
+             RAM: 32GB
+             CPU: 8
+             DISK: 4T
+
+Prepare the Operating System
+
+mkfs.xfs -L data /dev/vdc
+mkdir /data
+mount LABEL=data /data
+vi /etc/fstab
+LABEL=data /data xfs defaults,noatime 0 0
+
+reboot
+
+cd /etc/yum.repos.d
+# curl -O http://192.168.1.99/repos/CentOS-Base.repo
+# curl -O http://192.168.1.99/repos/epel.repo
+yum clean all
+yum makecache
+
+
+vi /etc/hosts 
+192.168.1.112 cassandra-1
+192.168.1.115 cassandra-2
+192.168.1.116 cassandra-3
+
+------------------------------------------------------------
+------------------------------------------------------------
+Install Java 8
+
+cd ~
+curl -O http://192.168.1.99/tools/jdk-8u151-linux-x64.rpm
+yum -y localinstall jdk-8u151-linux-x64.rpm
+java -version
+
+
+------------------------------------------------------------
+------------------------------------------------------------
+Scala
+
+cd /opt
+curl -O http://192.168.1.99/tools/scala-2.12.4.tgz
+curl -O http://192.168.1.99/tools/sbt-1.0.3.tgz
+
+tar zxf scala-2.12.4.tgz
+tar zxf sbt-1.0.3.tgz
+
+ln -s /opt/scala-2.12.4 /opt/scala
+
+vi .bash_profile
+PATH=$PATH:/opt/scala/bin:/opt/sbt/bin
+export JAVA_HOME=/usr/java/default
+export SCALA_HOME=/opt/scala
+export SBT_HOME=/opt/sbt
+
+
+------------------------------------------------------------
+------------------------------------------------------------
+Cassandra
+
+cd /opt
+curl -O http://192.168.1.99/tools/apache-cassandra-3.0.16-bin.tar.gz
+
+tar zxf apache-cassandra-3.0.16-bin.tar.gz
+
+ln -s /opt/apache-cassandra-3.0.16 /opt/cassandra
+
+mkdir -p /data/cassandra/data
+mkdir -p /data/cassandra/commitlog
+mkdir -p /data/cassandra/hints
+mkdir -p /data/cassandra/saved_caches
+
+-----
+
+vi conf/cassandra.yaml
+hints_directory: /data/cassandra/hints
+data_file_directories:
+    - /data/cassandra/data
+commitlog_directory: /data/cassandra/commitlog
+saved_caches_directory: /data/cassandra/saved_caches
+
+Start Cassandra in the foreground
+bin/cassandra -f
+
+bin/nodetool status
+
+bin/cqlsh localhost
+cqlsh> SELECT cluster_name, listen_address FROM system.local;
+
+cqlsh> CREATE SCHEMA schema1
+       WITH replication = { 'class' : 'SimpleStrategy', 'replication_factor' : 1 };
+cqlsh> USE schema1;
+cqlsh:Schema1> CREATE TABLE users (
+                 user_id varchar PRIMARY KEY,
+                 first varchar,
+                 last varchar,
+                 age int
+               );
+cqlsh:Schema1> INSERT INTO users (user_id, first, last, age)
+               VALUES ('jsmith', 'John', 'Smith', 42);
+cqlsh:Schema1> SELECT * FROM users;
+
+http://cassandra.apache.org/doc/latest/cql/ddl.html#create-keyspace
+
+
+thrift_framed_transport_size_in_mb: 100 
+commitlog_segment_size_in_mb: 64
+read_request_timeout_in_ms: 600000
+range_request_timeout_in_ms: 600000
+write_request_timeout_in_ms: 600000
+cas_contention_timeout_in_ms: 1000
+truncate_request_timeout_in_ms: 600000 
+request_timeout_in_ms: 600000
+batch_size_warn_threshold_in_kb: 5000
+batch_size_fail_threshold_in_kb: 10000
+https://docs.nomagic.com/display/TWCloud185/Installing+and+configuring+Cassandra+on+Linux
+
+
+
+Add new node:
+cd /opt
+curl -O http://192.168.1.99/tools/apache-cassandra-3.0.16-bin.tar.gz
+tar zxf apache-cassandra-3.0.16-bin.tar.gz
+ln -s /opt/apache-cassandra-3.0.16 /opt/cassandra
+mkdir -p /data/cassandra/data
+mkdir -p /data/cassandra/commitlog
+mkdir -p /data/cassandra/hints
+mkdir -p /data/cassandra/saved_caches
+# 从原来的节点获取配置文件，配置保持一致
+cd cassandra/conf/
+cp cassandra-1:/opt/cassandra/conf/cassandra-rackdc.properties ./
+cp cassandra-1:/opt/cassandra/conf/cassandra.yaml ./
+cp cassandra-1:/opt/cassandra/conf/jvm.options ./
+chown root:root cassandra-rackdc.properties
+chown root:root cassandra.yaml
+bin/cassandra
+bin/nodetool status
+# 增加新节点数据重新分布后，原有节点多余数据清除
+bin/nodetool repair -pr
+bin/nodetool cleanup
+
+------------------------------------------------------------
+------------------------------------------------------------
+zeppelin(query)
+
+cd /opt
+curl -O http://192.168.1.99/tools/zeppelin-0.8.0-bin-all.tgz
+
+tar zxf zeppelin-0.8.0-bin-all.tgz
+
+ln -s /opt/zeppelin-0.8.0-bin-all /opt/zeppelin
+
+/opt/zeppelin/bin/zeppelin-daemon.sh start
+
+cp zeppelin-site.xml.template zeppelin-site.xml
+vi zeppelin-site.xml
+  zeppelin.anonymous.allowed  =  false
+cp shiro.ini.template shiro.ini
+vi shiro.ini
+  [users]
+  user1=pass1, role1
+
+/opt/zeppelin/bin/zeppelin-daemon.sh restart
+
+zeppelin doc:
+https://ieevee.com/tech/2016/05/06/spark-5-zeppelin.html
+http://zeppelin.apache.org/
+------------------------------------------------------------
+------------------------------------------------------------
+Saprk
+
+Add spark master node:
+vi /etc/ssh/sshd_config
+systemctl restart sshd
+ssh-keygen
+ssh-copy-id -p 22222 cassandra-1
+ssh-copy-id -p 22222 cassandra-2
+ssh-copy-id -p 22222 cassandra-3
+cd /opt/
+curl -O http://192.168.1.99/tools/scala-2.12.4.tgz
+curl -O http://192.168.1.99/tools/sbt-1.0.3.tgz
+tar zxf scala-2.12.4.tgz 
+tar zxf sbt-1.0.3.tgz 
+chown -R root:root sbt scala-2.12.4/
+ln -s /opt/scala-2.12.4 /opt/scala
+vi ~/.bash_profile
+curl -O http://192.168.1.99/tools/spark-2.3.2-bin-hadoop2.7.tgz
+tar zxf spark-2.3.2-bin-hadoop2.7.tgz 
+ln -s /opt/spark-2.3.2-bin-hadoop2.7  /opt/spark
+cd spark/sbin
+vi slaves.sh         # note1
+vi spark-daemon.sh 
+cd /opt/spark/conf
+mv slaves.template slaves
+vi slaves 
+   cassandra-1
+   cassandra-2
+cp spark-env.sh.template spark-env.sh
+vi spark-env.sh
+   SPARK_MASTER_HOST=cassandra-1
+   SPARK_LOCAL_IP=192.168.1.112
+cd /opt/spark/sbin
+./stop-all.sh 
+
+note1: Open sbin/slaves.sh and sbin/spark-daemon.sh and then look for ssh command,
+pass the port argument to that command in your case *-p 2222* and save
+those files, do a start-all.sh :)
+pySpark
+yum install python2-pip -y
+pip install pyspark -i http://pypi.douban.com/simple --trusted-host pypi.douban.com
+
+Add spark slave node:
+vi /etc/ssh/sshd_config
+systemctl restart sshd
+cd /opt/
+java -version
+curl -O http://192.168.1.99/tools/scala-2.12.4.tgz
+curl -O http://192.168.1.99/tools/sbt-1.0.3.tgz
+tar zxf scala-2.12.4.tgz
+tar zxf sbt-1.0.3.tgz
+chown -R root:root sbt scala-2.12.4/
+ln -s /opt/scala-2.12.4 /opt/scala
+curl -O http://192.168.1.99/tools/spark-2.3.2-bin-hadoop2.7.tgz
+tar zxf spark-2.3.2-bin-hadoop2.7.tgz 
+ln -s /opt/spark-2.3.2-bin-hadoop2.7  /opt/spark
+cd spark/sbin
+vi start-slave.sh 
+vi slaves.sh 
+vi spark-daemon.sh 
+vi /etc/hosts   # add master host name
+vi ~/.bash_profile
+
+PATH=$PATH:/opt/scala/bin:/opt/sbt/bin:/opt/spark/bin
+export JAVA_HOME=/usr/java/default
+export SCALA_HOME=/opt/scala
+export SBT_HOME=/opt/sbt
+export SPARK_HOME=/opt/spark
+
+https://databricks.com/blog/2016/08/15/how-to-use-sparksession-in-apache-spark-2-0.html
+
+benchmark
+http://thelastpickle.com/blog/2018/08/08/compression_performance.html
+https://academy.datastax.com/planet-cassandra/nosql-performance-benchmarks
+https://tobert.github.io/pages/als-cassandra-21-tuning-guide.html
+https://docs.datastax.com/en/dse/6.0/dse-admin/datastax_enterprise/tools/toolsCStress.html
+# Insert (write) one million rows
+$ cassandra-stress write n=1000000 -rate threads=50
+
+# Read two hundred thousand rows.
+$ cassandra-stress read n=200000 -rate threads=50
+
+# Read rows for a duration of 3 minutes.
+$ cassandra-stress read duration=3m -rate threads=50
+
+# Read 200,000 rows without a warmup of 50,000 rows first.
+$ cassandra-stress read n=200000 no-warmup -rate threads=50
+
+
+操作
+bin/cqlsh 192.168.17.112
+
+cqlsh> SELECT cluster_name, listen_address FROM system.local;
+
+CREATE KEYSPACE testdb
+           WITH replication = {'class': 'SimpleStrategy', 'replication_factor' : 3};
+
+USE testdb
+
+DROP KEYSPACE testdb;
+
+CREATE TABLE posts (
+    userid text,
+    blog_title text,
+    posted_at timestamp,
+    entry_title text,
+    content text,
+    category int,
+    PRIMARY KEY (userid, blog_title, posted_at)
+)
+
+Java GC:
+https://docs.datastax.com/en/cassandra/3.0/cassandra/operations/opsTuneJVM.html
+Setting G1 as the Java garbage collector
+1. Open jvm.options.
+2. Comment out the -Xmn800M line.
+3. Comment out all lines in the ### CMS Settings section.
+4. Uncomment the relevant G1 settings in the ### G1 Settings section:
+  ## Use the Hotspot garbage-first collector.
+  -XX:+UseG1GC
+  #
+  ## Have the JVM do less remembered set work during STW, instead
+  ## preferring concurrent GC. Reduces p99.9 latency.
+  #-XX:G1RSetUpdatingPauseTimePercent=5
+
+Note: When using G1, you only need to set MAX_HEAP_SIZE. 
+Cassandra automatically calculates the maximum heap size (MAX_HEAP_SIZE) based on this formula:
+max(min(1/2 ram, 1024MB), min(1/4 ram, 8GB)
